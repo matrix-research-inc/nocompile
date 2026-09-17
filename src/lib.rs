@@ -45,6 +45,14 @@
 //! that stops failing, or starts failing for a different reason. On this crate's
 //! own UI suite it takes 33 golden lines down to 7.
 //!
+//! An `Exact` suite has one more lever, for the one part of a diagnostic the
+//! fixture does not control: [`TestCases::elide_implementors`] keeps the
+//! `= help:` heading that names a trait and replaces the list of its
+//! implementors with `$IMPLEMENTORS`. rustc prints those in sorted order, so
+//! without it a public impl added anywhere in the crate under test re-blesses
+//! every golden whose diagnostic reaches that trait, including the ones
+//! asserting something else entirely.
+//!
 //! # Build, not check
 //!
 //! Fixtures are compiled with `cargo build` rather than `cargo check`, which

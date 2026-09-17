@@ -41,11 +41,12 @@ t.mode(nocompile::Mode::Brief);                 // less brittle comparison, belo
 t.compile_fail("tests/ui/just_this_one.rs");
 t.pass_dir("tests/ui-pass");                  // fixtures that must still compile
 t.edition("2024");
+t.elide_implementors(true);                   // keep the trait, drop its implementor list
 t.raw_manifest_lines("[features]\nfoo = []"); // escape hatch
 let outcome = t.run();                        // non-panicking, returns a report
 ```
 
-One struct, ten methods, two enums. That is the whole library.
+One struct, eleven methods, two enums. That is the whole library.
 
 ## Living with toolchain churn
 
@@ -316,6 +317,25 @@ The same argument one step further out. Where a diagnostic lists the types imple
 The number is a fact about the crate graph, not about the fixture. Adding one `Pod` impl anywhere moves it in every golden whose diagnostic reaches that trait — including all the goldens testing something else entirely, which then have to be re-blessed with a diff that has nothing to do with what they assert.
 
 A list long enough that rustc might elide it is truncated to the shape rustc's own elision produces: the first eight entries and `and $N others`. Where rustc draws that line has moved between releases, and a golden should not record which side of it your current toolchain sits on. `trybuild` normalizes both, so a migrating golden matches.
+
+#### Eliding the list
+
+*Which* implementors rustc prints is a fact about the crate graph too, and no substitution reaches it. The entries are sorted, so one impl added anywhere in the crate under test can displace an entry out of the eight that survive. That is the implementor list's whole problem: it is the one part of a diagnostic whose *content* is decided by code the fixture never mentions, which makes it the one part a golden cannot own. Adding a public type with two trait impls to a crate under test has re-blessed goldens that were asserting a `#[diagnostic::on_unimplemented]` message and had nothing to do with either the type or the trait.
+
+A suite that would rather pin the diagnostic it authored can drop the entries:
+
+```rust
+t.elide_implementors(true);
+```
+
+The heading stays — it names the trait, which the crate under test does own — and everything under it, including any `and $N others`, becomes one line:
+
+```
+  = help: the following other types implement trait `Pod`:
+            $IMPLEMENTORS
+```
+
+Opt-in, because the default has to stay what `trybuild` writes. Turning it on moves only the goldens that hold such a list, so blessing afterwards is a small diff. And the cost is worth stating plainly: a golden that elides the list no longer notices if a trait *stops* being implemented for a type it used to list. What it still asserts is the part the fixture is about — the error, its span, the trait's name, and any message the crate authored. `Brief` drops the list along with every other `= help:` line, so a `Brief` suite does not need this.
 
 ## Migrating from trybuild
 
