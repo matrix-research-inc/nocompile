@@ -633,9 +633,11 @@ fn continues_past(lines: &[String], index: usize, column: usize) -> bool {
 /// on: a golden no longer notices a trait ceasing to be implemented for a type
 /// it used to list.
 ///
-/// The list is delimited exactly as [`truncate_implementor_lists`] delimits it,
-/// so the two rules agree about which lines belong to a list and differ only in
-/// what they do with them.
+/// The entries are delimited as [`truncate_implementor_lists`] delimits them.
+/// The one place the two rules disagree is the summary: truncation treats it as
+/// the line that closes a list and keeps it, being the tail it would otherwise
+/// have written itself, while elision treats it as part of the list and absorbs
+/// it, the placeholder already standing for what it was counting.
 fn elide_implementor_lists(lines: &mut Vec<String>) {
     // Whether the list currently open has had its placeholder written, or
     // `None` between lists.
@@ -1936,6 +1938,20 @@ mod tests {
 
     /// The list's own lines, entries and summary alike: the summary sits two
     /// columns in from an entry, so the shallowest of them is the bound.
+    /// [`implementor_list`] with the summary rustc writes when it stops early.
+    ///
+    /// rustc indents that line two columns in from the entries rather than at
+    /// their column, and the shallower indent is the only thing separating it
+    /// from the line that ends a list. A summary built at the entries' column
+    /// is an entry as far as either rule can tell.
+    fn implementor_list_with_summary(entries: &[&str]) -> String {
+        const NOTE: &str = "note: required by a bound in `f`\n";
+        // Eleven columns, two in from the thirteen `implementor_list` indents
+        // its entries to.
+        const SUMMARY_LINE: &str = "           and 568 others\n";
+        implementor_list(entries).replace(NOTE, &format!("{SUMMARY_LINE}{NOTE}"))
+    }
+
     fn entry_lines(text: &str) -> Vec<String> {
         text.lines()
             .filter(|line| line.starts_with(&" ".repeat(ENTRY_COLUMN - 2)))
@@ -2054,10 +2070,24 @@ mod tests {
     fn eliding_collapses_a_summary_rustc_wrote_itself() {
         // The count is already `$N` by the time the elision runs, and it is
         // counting implementors the placeholder now stands for, so it goes with
-        // the entries rather than surviving as a lonely tail.
-        let mut listed = entries(8);
-        listed.push("and 568 others".to_string());
-        assert_eq!(entry_lines(&elided(&listed)), [IMPLEMENTORS]);
+        // the entries rather than surviving as a lonely tail. The summary sits
+        // at the column rustc gives it, because the clause that absorbs one is
+        // the only structural difference between this rule and truncation, and
+        // a summary at the entries' column would exercise the entry path
+        // instead and leave that clause unasserted.
+        let listed: Vec<String> = entries(8);
+        let borrowed: Vec<&str> = listed.iter().map(String::as_str).collect();
+        let text = implementor_list_with_summary(&borrowed);
+        let out = normalizer()
+            .eliding_implementors(true)
+            .normalize(&text, "tests/ui/a.rs");
+        assert_eq!(entry_lines(&out), [IMPLEMENTORS]);
+
+        // The same input under the default, where the summary is the tail the
+        // truncation keeps. This is the disagreement the two rules have about
+        // which lines belong to a list, pinned from both sides.
+        let kept = normalizer().normalize(&text, "tests/ui/a.rs");
+        assert_eq!(entry_lines(&kept).last().map(String::as_str), Some(SUMMARY));
     }
 
     #[test]
