@@ -278,6 +278,7 @@ Normalization is a short, fixed list of substitutions and is meant to stay that 
 | the toolchain's own source | `$RUST` |
 | each declared path dependency outside `$DIR` | `$NAME_OF_THE_CRATE` |
 | the count in `and N others` | `$N` |
+| an implementor list's entries (opt-in, see [below](#eliding-the-list)) | `$IMPLEMENTORS` |
 
 `$RUST` covers all three shapes a toolchain path takes — a rustup toolchain, whose path carries both your home directory *and* the host triple, the older `src/rust/src` layout, and the `/rustc/<commit>/library` form. Any trait bound involving a std type produces one of these, so without it a golden passes only on the machine that blessed it.
 
@@ -335,7 +336,7 @@ The heading stays — it names the trait, which the crate under test does own �
             $IMPLEMENTORS
 ```
 
-Opt-in, because the default has to stay what `trybuild` writes. Turning it on moves only the goldens that hold such a list, so blessing afterwards is a small diff. And the cost is worth stating plainly: a golden that elides the list no longer notices if a trait *stops* being implemented for a type it used to list. What it still asserts is the part the fixture is about — the error, its span, the trait's name, and any message the crate authored. `Brief` drops the list along with every other `= help:` line, so a `Brief` suite does not need this.
+Opt-in, because the default has to stay what `trybuild` writes. Turning it on moves only the goldens that hold such a list, so blessing afterwards is a small diff. And the cost is worth stating plainly: a golden that elides the list no longer notices if a trait *stops* being implemented for a type it used to list. What it still asserts is the part the fixture is about — the error, its span, the trait's name, and any message the crate authored. Unlike `Brief`, this is a normalization rule rather than a comparison filter, so it applies to the diagnostics and not to the golden: turning it on requires a bless, and the diff names exactly which lists went. `Brief` drops the list along with every other `= help:` line, so a `Brief` suite does not need this.
 
 ## Migrating from trybuild
 
