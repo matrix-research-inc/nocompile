@@ -46,6 +46,14 @@
 //! line has moved between releases, and a golden should not record which side of
 //! it the current toolchain sits on.
 //!
+//! Neither rule touches *which* implementors rustc chose to print, and that is
+//! a fact about the crate graph too: the entries are sorted, so one impl added
+//! anywhere can displace an entry out of the eight that survive. A suite that
+//! cannot afford that can ask for the entries to go entirely, leaving the
+//! heading and a `$IMPLEMENTORS` placeholder -- see
+//! [`TestCases::elide_implementors`](crate::TestCases::elide_implementors). It
+//! is opt-in because the default has to stay what `trybuild` writes.
+//!
 //! # What `$RUST` does not hide
 //!
 //! The placeholder hides *where* the toolchain's source lives, not *whether* it
@@ -105,6 +113,8 @@ pub(crate) const RUST: &str = "$RUST";
 pub(crate) const CRATE: &str = "$CRATE";
 /// Placeholder for the count of implementors rustc chose not to list.
 pub(crate) const OTHERS: &str = "$N";
+/// Placeholder for an implementor list the harness elided in full.
+pub(crate) const IMPLEMENTORS: &str = "$IMPLEMENTORS";
 
 /// The path rewrites for one fixture.
 ///
@@ -131,6 +141,8 @@ pub(crate) struct Normalizer {
     /// One `(absolute path, placeholder)` per declared path dependency, longest
     /// path first.
     dependencies: Vec<(String, String)>,
+    /// Whether an implementor list loses its entries rather than its tail.
+    elide_implementors: bool,
 }
 
 impl Normalizer {
@@ -162,7 +174,20 @@ impl Normalizer {
             cargo_home: cargo_home().map(|home| fold_separators(&home)),
             sysroot: sysroot().map(str::to_string),
             dependencies,
+            elide_implementors: false,
         }
+    }
+
+    /// Elide every implementor list's entries rather than truncating its tail.
+    ///
+    /// Chained onto `new` rather than passed to it, because every other field
+    /// describes where this fixture was compiled, while this one is a choice the
+    /// caller made about what the goldens should assert. See
+    /// [`TestCases::elide_implementors`](crate::TestCases::elide_implementors)
+    /// for why a suite would want it.
+    pub(crate) fn eliding_implementors(mut self, elide: bool) -> Self {
+        self.elide_implementors = elide;
+        self
     }
 
     /// Rewrite `text` so it says the same thing on any machine.
@@ -208,8 +233,13 @@ impl Normalizer {
         }
 
         // Before the gutters are re-aligned, so that the alignment sees the
-        // lines the golden will actually hold.
-        truncate_implementor_lists(&mut lines);
+        // lines the golden will actually hold. The two rules are alternatives:
+        // eliding a list leaves nothing for the truncation to shorten.
+        if self.elide_implementors {
+            elide_implementor_lists(&mut lines);
+        } else {
+            truncate_implementor_lists(&mut lines);
+        }
 
         // Last, because it is the blanking above that frees the width it
         // reclaims.
@@ -586,6 +616,68 @@ fn continues_past(lines: &[String], index: usize, column: usize) -> bool {
     lines
         .get(index + 1)
         .is_some_and(|next| next.len() - next.trim_start().len() == column)
+}
+
+/// Replace every implementor list's entries with a single `$IMPLEMENTORS`.
+///
+/// Opt-in, because the default has to stay the shape `trybuild` writes. What it
+/// buys is the last thing a golden records about the crate graph rather than
+/// about the fixture. Truncating the tail takes the *count* of
+/// unlisted implementors out, but not the identity of the listed ones -- rustc
+/// sorts them, so one impl added anywhere can displace an entry out of the eight
+/// that survive, and every golden whose diagnostic reaches that trait is
+/// re-blessed over a change none of them assert.
+///
+/// The heading stays, because it names the trait, and that much the crate under
+/// test does own. What the elision costs is stated with the method that turns it
+/// on: a golden no longer notices a trait ceasing to be implemented for a type
+/// it used to list.
+///
+/// The entries are delimited as [`truncate_implementor_lists`] delimits them.
+/// The one place the two rules disagree is the summary: truncation treats it as
+/// the line that closes a list and keeps it, being the tail it would otherwise
+/// have written itself, while elision treats it as part of the list and absorbs
+/// it, the placeholder already standing for what it was counting.
+fn elide_implementor_lists(lines: &mut Vec<String>) {
+    // Whether the list currently open has had its placeholder written, or
+    // `None` between lists.
+    let mut elided: Option<bool> = None;
+    // Where the next surviving line goes.
+    let mut kept = 0;
+
+    for index in 0..lines.len() {
+        let trimmed = lines[index].trim_start();
+        let column = lines[index].len() - trimmed.len();
+        let summary = trimmed == SUMMARY;
+
+        if IMPLEMENTOR_HEADINGS
+            .iter()
+            .any(|heading| trimmed.starts_with(heading))
+        {
+            elided = Some(false);
+        } else if let Some(written) = elided {
+            if column < ENTRY_COLUMN && !summary {
+                // The `note:` or span rustc prints after the list.
+                elided = None;
+            } else {
+                // A summary rustc wrote itself is the end of its list, and goes
+                // with the entries above it: the placeholder already stands for
+                // the implementors it was counting.
+                elided = if summary { None } else { Some(true) };
+                if written {
+                    continue;
+                }
+                // At the column of the line it replaces, so the placeholder
+                // stands where the entries stood.
+                lines[index].replace_range(column.., IMPLEMENTORS);
+            }
+        }
+
+        lines.swap(kept, index);
+        kept += 1;
+    }
+
+    lines.truncate(kept);
 }
 
 /// Re-align each diagnostic's gutter to the widest line number left in it.
@@ -1040,6 +1132,7 @@ mod tests {
             cargo_home: Some("/home/u/.cargo".into()),
             sysroot: Some("/home/u/.rustup/toolchains/stable".into()),
             dependencies: Vec::new(),
+            elide_implementors: false,
         }
     }
 
@@ -1845,6 +1938,20 @@ mod tests {
 
     /// The list's own lines, entries and summary alike: the summary sits two
     /// columns in from an entry, so the shallowest of them is the bound.
+    /// [`implementor_list`] with the summary rustc writes when it stops early.
+    ///
+    /// rustc indents that line two columns in from the entries rather than at
+    /// their column, and the shallower indent is the only thing separating it
+    /// from the line that ends a list. A summary built at the entries' column
+    /// is an entry as far as either rule can tell.
+    fn implementor_list_with_summary(entries: &[&str]) -> String {
+        const NOTE: &str = "note: required by a bound in `f`\n";
+        // Eleven columns, two in from the thirteen `implementor_list` indents
+        // its entries to.
+        const SUMMARY_LINE: &str = "           and 568 others\n";
+        implementor_list(entries).replace(NOTE, &format!("{SUMMARY_LINE}{NOTE}"))
+    }
+
     fn entry_lines(text: &str) -> Vec<String> {
         text.lines()
             .filter(|line| line.starts_with(&" ".repeat(ENTRY_COLUMN - 2)))
@@ -1936,6 +2043,157 @@ mod tests {
         assert_eq!(out, text);
     }
 
+    /// The same list under `elide_implementors`, which is off everywhere else in
+    /// this module.
+    fn elided(entries: &[String]) -> String {
+        let borrowed: Vec<&str> = entries.iter().map(String::as_str).collect();
+        normalizer()
+            .eliding_implementors(true)
+            .normalize(&implementor_list(&borrowed), "tests/ui/a.rs")
+    }
+
+    #[test]
+    fn eliding_collapses_a_list_rustc_printed_in_full() {
+        // Three entries, well short of the length either harness summarizes at,
+        // so nothing but the elision can have removed them.
+        assert_eq!(entry_lines(&elided(&entries(3))), [IMPLEMENTORS]);
+    }
+
+    #[test]
+    fn eliding_collapses_a_list_past_the_summary_threshold() {
+        // Long enough that this module would otherwise have written the summary
+        // itself, and long enough that rustc might have.
+        assert_eq!(entry_lines(&elided(&entries(40))), [IMPLEMENTORS]);
+    }
+
+    #[test]
+    fn eliding_collapses_a_summary_rustc_wrote_itself() {
+        // The count is already `$N` by the time the elision runs, and it is
+        // counting implementors the placeholder now stands for, so it goes with
+        // the entries rather than surviving as a lonely tail. The summary sits
+        // at the column rustc gives it, because the clause that absorbs one is
+        // the only structural difference between this rule and truncation, and
+        // a summary at the entries' column would exercise the entry path
+        // instead and leave that clause unasserted.
+        let listed: Vec<String> = entries(8);
+        let borrowed: Vec<&str> = listed.iter().map(String::as_str).collect();
+        let text = implementor_list_with_summary(&borrowed);
+        let out = normalizer()
+            .eliding_implementors(true)
+            .normalize(&text, "tests/ui/a.rs");
+        assert_eq!(entry_lines(&out), [IMPLEMENTORS]);
+
+        // The same input under the default, where the summary is the tail the
+        // truncation keeps. This is the disagreement the two rules have about
+        // which lines belong to a list, pinned from both sides.
+        let kept = normalizer().normalize(&text, "tests/ui/a.rs");
+        assert_eq!(entry_lines(&kept).last().map(String::as_str), Some(SUMMARY));
+    }
+
+    #[test]
+    fn eliding_keeps_the_heading_that_names_the_trait() {
+        // The heading is the part of the list the crate under test owns: it
+        // names the trait the fixture failed to satisfy. Only the entries
+        // beneath it are decided by code the fixture never mentions.
+        let out = elided(&entries(12));
+        assert!(
+            out.contains("   = help: the following other types implement trait `Pod`:\n"),
+            "{out}"
+        );
+        assert!(!out.contains("Type"), "{out}");
+    }
+
+    #[test]
+    fn eliding_places_the_placeholder_where_the_entries_were() {
+        // At an entry's own column rather than the summary's: it stands for the
+        // entries, so it is indented like one.
+        let out = elided(&entries(12));
+        assert!(out.contains("\n             $IMPLEMENTORS\n"), "{out}");
+    }
+
+    #[test]
+    fn eliding_collapses_each_list_independently() {
+        // Two traits in one stderr is the ordinary case for a bound with more
+        // than one unsatisfied predicate, and the second list must not be
+        // swallowed by the first, nor the prose between them.
+        let mut text = String::new();
+        for (trait_name, count) in [("Pod", 3), ("Zeroable", 12)] {
+            text.push_str(&format!(
+                "   = help: the following other types implement trait `{trait_name}`:\n"
+            ));
+            for i in 0..count {
+                text.push_str(&format!("             Type{i}\n"));
+            }
+            text.push_str(&format!("note: required by a bound in `{trait_name}`\n"));
+        }
+
+        let out = normalizer()
+            .eliding_implementors(true)
+            .normalize(&text, "tests/ui/a.rs");
+        assert_eq!(
+            out,
+            concat!(
+                "   = help: the following other types implement trait `Pod`:\n",
+                "             $IMPLEMENTORS\n",
+                "note: required by a bound in `Pod`\n",
+                "   = help: the following other types implement trait `Zeroable`:\n",
+                "             $IMPLEMENTORS\n",
+                "note: required by a bound in `Zeroable`\n",
+            )
+        );
+    }
+
+    #[test]
+    fn eliding_leaves_a_help_that_is_not_an_implementor_heading_alone() {
+        // The heading is what opens a list, here as in the truncation rule. A
+        // `= help:` the crate under test wrote itself, with indented lines of
+        // its own, is the rendering an `Exact` suite is there to pin.
+        let mut text = String::from("   = help: consider one of the shapes below:\n");
+        for i in 0..12 {
+            text.push_str(&format!("             a named field {i}\n"));
+        }
+        let out = normalizer()
+            .eliding_implementors(true)
+            .normalize(&text, "tests/ui/a.rs");
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn the_default_leaves_every_implementor_list_exactly_as_it_was() {
+        // The regression guard for the option being opt-in. `Exact` is the
+        // default because it is what `trybuild` writes, so a golden blessed
+        // before this option existed has to compare byte for byte after it: the
+        // truncation rule, at every length either side of its threshold, and no
+        // placeholder anywhere.
+        for count in 0..=12 {
+            let expected = if count > SUMMARIZED_AT {
+                let mut kept = entries(SUMMARIZED_AT - 1);
+                kept.push(SUMMARY.to_string());
+                kept
+            } else {
+                entries(count)
+            };
+            let out = rendered(&entries(count));
+            assert_eq!(entry_lines(&out), expected, "a list of {count}");
+            assert!(!out.contains(IMPLEMENTORS), "a list of {count}: {out}");
+        }
+    }
+
+    #[test]
+    fn new_does_not_elide_implementors() {
+        // The field the default rests on, read where `Normalizer::new` sets it
+        // rather than only through the test helper above.
+        let normalizer = Normalizer::new(
+            Path::new("/w/target/nocompile/host"),
+            Path::new("/w/target/nocompile/host/project/src/bin/f_a.rs"),
+            "f_a",
+            Path::new("/w"),
+            &[],
+        );
+        assert!(!normalizer.elide_implementors);
+        assert!(normalizer.eliding_implementors(true).elide_implementors);
+    }
+
     #[test]
     fn does_not_summarize_lines_outside_an_implementor_list() {
         // The heading is what opens a list. Ten indented lines under anything
@@ -1961,6 +2219,7 @@ mod tests {
             cargo_home: Some("C:/Users/u/.cargo".into()),
             sysroot: Some("C:/Users/u/.rustup/toolchains/stable".into()),
             dependencies: Vec::new(),
+            elide_implementors: false,
         }
     }
 

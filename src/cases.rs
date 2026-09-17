@@ -56,6 +56,7 @@ pub struct TestCases {
     host_pkg_name: String,
     edition: String,
     mode: Mode,
+    elide_implementors: bool,
     overwrite: Option<bool>,
     dependencies: Vec<Dependency>,
     raw_manifest_lines: Vec<String>,
@@ -75,6 +76,7 @@ impl TestCases {
             host_pkg_name: host_pkg_name.into(),
             edition: DEFAULT_EDITION.to_string(),
             mode: Mode::default(),
+            elide_implementors: false,
             overwrite: None,
             dependencies: Vec::new(),
             raw_manifest_lines: Vec::new(),
@@ -136,6 +138,45 @@ impl TestCases {
     /// Choose how diagnostics are compared against goldens. See [`Mode`].
     pub fn mode(&mut self, mode: Mode) -> &mut Self {
         self.mode = mode;
+        self
+    }
+
+    /// Replace the list of types implementing a trait with a placeholder.
+    /// Defaults to off.
+    ///
+    /// Where a diagnostic lists the implementors of a trait, the heading is
+    /// kept and the entries under it -- including any `and $N others` -- become
+    /// one `$IMPLEMENTORS` line:
+    ///
+    /// ```text
+    ///   = help: the following other types implement trait `Pod`:
+    ///             $IMPLEMENTORS
+    /// ```
+    ///
+    /// That list is the one part of a diagnostic whose *content* depends on
+    /// code the fixture never mentions, which makes it the one part a golden
+    /// cannot own. rustc prints the first few implementors in sorted order, so
+    /// adding a public impl anywhere in the crate under test can displace an
+    /// entry out of the ones it printed -- and every golden whose diagnostic
+    /// reaches that trait then has to be re-blessed, including the ones
+    /// asserting a `#[diagnostic::on_unimplemented]` message that did not
+    /// change. A suite going red on a purely additive change is exactly the
+    /// churn normalization exists to prevent.
+    ///
+    /// The tradeoff is real and worth stating plainly: a golden that elides the
+    /// list no longer notices if a trait *stops* being implemented for a type it
+    /// used to list. The heading survives, so the trait's name is still
+    /// asserted, and the fixture's own error still is. The identity of the other
+    /// implementors is not.
+    ///
+    /// It is off unless asked for, because the default has to stay what
+    /// `trybuild` writes -- see [`Mode::Exact`]. Turning it on changes the
+    /// goldens holding such a list and no others, so blessing afterwards is a
+    /// small, readable diff.
+    /// [`Mode::Brief`] drops the list along with every other `= help:` line, and
+    /// does not need this.
+    pub fn elide_implementors(&mut self, elide: bool) -> &mut Self {
+        self.elide_implementors = elide;
         self
     }
 
@@ -263,7 +304,8 @@ impl TestCases {
                     &case.bin,
                     &self.manifest_dir,
                     &self.dependencies,
-                );
+                )
+                .eliding_implementors(self.elide_implementors);
                 let result = self.check_case(case, &normalizer, &build);
                 CaseOutcome::new(PathBuf::from(&case.relative), case.kind, result)
             })
@@ -588,6 +630,16 @@ mod tests {
             "{}",
             outcome.report()
         );
+    }
+
+    #[test]
+    fn implementor_lists_are_elided_only_when_asked_for() {
+        // The default is the `trybuild`-compatible one, and a golden blessed
+        // before this option existed must not move until a suite opts in.
+        let mut t = TestCases::new("/w", "host");
+        assert!(!t.elide_implementors);
+        t.elide_implementors(true);
+        assert!(t.elide_implementors);
     }
 
     #[test]

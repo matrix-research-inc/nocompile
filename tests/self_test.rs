@@ -682,6 +682,93 @@ fn a_declared_path_dependency_reaches_the_fixtures() {
     assert!(golden.contains("--> ui/misuses_helper.rs:2:22"), "{golden}");
 }
 
+/// A crate with a trait, one implementor per name, and a bound that rejects
+/// anything else. rustc lists the implementors under a `= help:` heading,
+/// sorted, keeping only the first several.
+fn trait_with_implementors(types: &[&str]) -> String {
+    let mut source = String::from("pub trait Small {}\npub fn take<T: Small>(_value: T) {}\n");
+    for name in types {
+        source.push_str(&format!("pub struct {name};\nimpl Small for {name} {{}}\n"));
+    }
+    source
+}
+
+/// The twelve implementors the golden is blessed against, and the one added
+/// afterwards. `Aaa` sorts ahead of all of them, so rustc prints it and drops
+/// one that was there before -- the whole of the change, from the golden's point
+/// of view.
+const IMPLEMENTORS: [&str; 12] = [
+    "Tab", "Tbb", "Tcb", "Tdb", "Teb", "Tfb", "Tgb", "Thb", "Tib", "Tjb", "Tkb", "Tlb",
+];
+const ADDED: &str = "Aaa";
+
+/// An implementor list is the one part of a diagnostic whose content is decided
+/// by code the fixture never mentions: rustc prints the implementors of a trait
+/// in sorted order, so a public impl added anywhere in the crate under test can
+/// displace an entry out of the ones it printed. `elide_implementors` takes the
+/// entries out of the golden, and this is the case that motivated it.
+///
+/// Both halves are asserted. The elided golden survives the addition, and --
+/// the premise, rather than an assumption -- the same addition breaks the same
+/// golden when the list is in it.
+#[test]
+fn an_elided_implementor_list_survives_an_impl_added_to_the_crate_under_test() {
+    let sandbox = Sandbox::new("elided-implementors");
+    sandbox.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    );
+    sandbox.write("helper/src/lib.rs", &trait_with_implementors(&IMPLEMENTORS));
+    sandbox.write(
+        "ui/unimplemented.rs",
+        "fn main() {\n    helper::take(\"not small\");\n}\n",
+    );
+
+    let mut t = sandbox.cases();
+    t.dependency_path("helper", "helper");
+    t.elide_implementors(true);
+    t.compile_fail("ui/unimplemented.rs");
+
+    assert_passed(&t.overwrite(true).run());
+    let golden = sandbox.read("ui/unimplemented.stderr");
+    // The heading names the trait, which the crate under test does own, so it
+    // stays and is still asserted.
+    assert!(
+        golden.contains("implement trait `Small`"),
+        "the heading should survive:\n{golden}"
+    );
+    assert!(
+        golden.contains("$IMPLEMENTORS"),
+        "the entries should have collapsed:\n{golden}"
+    );
+    assert!(
+        !golden.contains(IMPLEMENTORS[0]),
+        "an implementor reached the golden:\n{golden}"
+    );
+
+    // One public impl added, and nothing else. The golden asserts the same
+    // thing it did before and must still hold.
+    let grown: Vec<&str> = std::iter::once(ADDED).chain(IMPLEMENTORS).collect();
+    sandbox.write("helper/src/lib.rs", &trait_with_implementors(&grown));
+    assert_passed(&t.overwrite(false).run());
+
+    // The premise: with the list in the golden, that same addition is a
+    // failure. Without this the pass above could be proving nothing.
+    let mut listing = sandbox.cases();
+    listing.dependency_path("helper", "helper");
+    listing.compile_fail("ui/unimplemented.rs");
+    sandbox.write("helper/src/lib.rs", &trait_with_implementors(&IMPLEMENTORS));
+    assert_passed(&listing.overwrite(true).run());
+    sandbox.write("helper/src/lib.rs", &trait_with_implementors(&grown));
+
+    let outcome = listing.overwrite(false).run();
+    let failure = sole_failure(&outcome);
+    assert!(
+        matches!(failure, Failure::Mismatch { .. }),
+        "expected the added impl to break the un-elided golden, got {failure:?}"
+    );
+}
+
 /// A run reports every case, not just the first to fail.
 #[test]
 fn all_cases_are_reported_not_just_the_first_failure() {
