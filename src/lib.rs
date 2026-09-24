@@ -22,41 +22,40 @@
 //! }
 //! ```
 //!
-//! Every fixture becomes a bin target of one generated project and they all
-//! compile in a single, parallel `cargo build`. A `compile_fail` fixture must fail, and
-//! its diagnostics must match the `.stderr` golden beside it. Run the suite with
-//! `NOCOMPILE=overwrite` to write the goldens, then **read what they captured** --
-//! a missing golden is a failure rather than an implicit bless precisely so that
-//! step does not get skipped.
+//! A `compile_fail` fixture must fail, and its diagnostics must match the
+//! `.stderr` golden beside it. Run the suite with `NOCOMPILE=overwrite` to write
+//! the goldens, then **read what they captured**. A missing golden is a failure
+//! rather than an implicit bless, so that step cannot be skipped.
 //!
-//! # Living with toolchain churn
+//! # Choosing a mode
 //!
-//! Goldens of rendered diagnostics break whenever rustc reflows a message. That
-//! is inherent to the technique, but [`Mode::Brief`] makes it much cheaper:
+//! Goldens of rendered diagnostics break whenever rustc reflows a message. The
+//! [`Mode`] decides how much of each diagnostic is compared, and so how often
+//! that happens:
+//!
+//! - [`Mode::Exact`], the default, compares the full rendering. Use it when the
+//!   rendering is the product: a `#[diagnostic::on_unimplemented]` message, a
+//!   `= help:` you wrote, a span you placed on purpose.
+//! - [`Mode::Brief`] compares each error code, primary message and span, and
+//!   drops the snippets, underline art and `= note:` lines a rustc release
+//!   reflows. Use it when goldens are committed and CI builds on more than one
+//!   toolchain, which is most crates.
+//! - [`Mode::BriefLocal`] is `Brief` minus the spans outside the fixture. Use it
+//!   when diagnostics reach into the crate under test, as a const-evaluated
+//!   guard's do, and its internal layout should be free to change.
 //!
 //! ```no_run
 //! # let mut t = nocompile::cases!();
 //! t.mode(nocompile::Mode::Brief);
 //! ```
 //!
-//! `Brief` compares only error codes, primary messages and span headers, and
-//! drops the source snippets, underline art and `= note:` lines that a rustc
-//! release reflows. It still catches every regression that matters: a fixture
-//! that stops failing, or starts failing for a different reason. On this crate's
-//! own UI suite it takes 33 golden lines down to 7.
+//! Both `Brief` modes filter both sides of the comparison, so an existing
+//! `Exact` golden passes unchanged after switching.
 //!
-//! [`Mode::BriefLocal`] goes one step further and keeps only the span headers
-//! that point into the fixture. The others have already lost their line
-//! numbers, so they record only which files of the crate under test a
-//! diagnostic passed through, and a refactor of that crate re-blesses them.
-//!
-//! An `Exact` suite has one more lever, for the one part of a diagnostic the
-//! fixture does not control: [`TestCases::elide_implementors`] keeps the
-//! `= help:` heading that names a trait and replaces the list of its
-//! implementors with `$IMPLEMENTORS`. rustc prints those in sorted order, so
-//! without it a public impl added anywhere in the crate under test re-blesses
-//! every golden whose diagnostic reaches that trait, including the ones
-//! asserting something else entirely.
+//! An `Exact` suite has one more lever: [`TestCases::elide_implementors`]
+//! replaces the list of a trait's implementors with `$IMPLEMENTORS`, so an impl
+//! added anywhere in the crate under test does not re-bless goldens that were
+//! asserting something else.
 //!
 //! # Build, not check
 //!
@@ -75,68 +74,57 @@
 //!
 //! `cargo check` compiles that without a word; `cargo build` fails it with
 //! `E0080: evaluation panicked: N must be a power of two`, the guard's own
-//! message. `trybuild` runs `cargo check` unless the suite also contains a
-//! `pass` fixture, so a check-only compile-fail suite passes a fixture like this
-//! one silently. The cost is scratch disk: codegen and linking leave a binary
-//! per fixture. Debug info and incremental compilation are turned off for that
-//! build, since neither is observable in a diagnostic.
+//! message.
 //!
-//! # Zero dependencies, dev-dependencies included
+//! # Compared with `trybuild`
 //!
-//! This crate depends on nothing but `std`, and it has no dev-dependencies
-//! either -- a `[dev-dependencies]` entry shows up in `cargo tree` for anyone
-//! auditing the source, and a harness that reaches for a helper crate to test
-//! itself has undermined its own pitch. Its own compile-fail suite is run by
-//! itself.
+//! [`trybuild`] is the standard answer, and the right one if you need what this
+//! crate deliberately leaves out: glob patterns, `-Z` flags and nightly-only
+//! features, running the compiled program, or dependencies inferred from your
+//! manifest. For the core job, `nocompile` is the stronger harness:
 //!
-//! If you do not track your dependency count, [`trybuild`] is more capable and
-//! you should use it. This crate is for the case where a handful of compile-fail
-//! fixtures should not cost a serialization framework and a TOML parser in the
-//! lock file.
+//! - It catches guards like the one above. `trybuild` runs `cargo check` unless
+//!   the suite also has a `pass` fixture, and then passes such a fixture without
+//!   asserting anything.
+//! - [`Mode::Brief`] and [`Mode::BriefLocal`] let goldens survive toolchain
+//!   upgrades. A `trybuild` golden is always the full rendering.
+//! - A path dependency's own warnings stay with the dependency instead of being
+//!   replayed into every fixture's golden.
+//! - Fixtures see only the dependencies you declare, not every dev-dependency of
+//!   the host crate.
+//! - `RUSTFLAGS` and every `CARGO_PROFILE_*` variable are cleared for the
+//!   fixture build, so a shell variable cannot change what a golden records.
+//! - It depends on nothing but `std`, dev-dependencies included, so it adds
+//!   nothing to your lockfile. Its own compile-fail suite is run by itself.
 //!
 //! [`trybuild`]: https://docs.rs/trybuild
 //!
-//! # Scope
+//! # Requirements
 //!
-//! Deliberately out: running the compiled program and checking its output, glob
-//! patterns, inferring dependencies from the host manifest, `-Z` flags, and
-//! nightly-only features. The moment a suite needs any of those, `trybuild` is
-//! the answer. Fixtures *are* built for whatever target the suite itself was
-//! built for, so a `no_std` crate can test an invariant about its own target;
-//! goldens are target-specific in the same way they are toolchain-specific.
-//!
-//! Linux, macOS and Windows are supported, and a golden blessed on one matches
-//! on the others: the paths the harness knows are folded to `/` separators, and
-//! a golden checked out with CRLF line endings compares as the LF one it wrote.
-//!
-//! # Requirements on fixtures
-//!
-//! - A fixture is built as a bin and compiled **verbatim**, so it must define
-//!   `fn main`, as `trybuild` fixtures do. The harness does not add one:
-//!   detecting a real `fn main` needs a parser, and a wrong guess writes
-//!   harness-injected source into the golden under the fixture's own name. A
-//!   fixture without one gets a plain `E0601`, which says what to do about it.
+//! - A fixture is built as a bin and compiled verbatim, so it must define
+//!   `fn main`, as `trybuild` fixtures do. Without one you get a plain `E0601`.
 //! - Fixtures build with `--offline`, so any dependency must be a path
 //!   dependency or already in the local cargo cache.
-//! - Warnings from the crate under test land in the fixture's stderr and so in
-//!   its golden, exactly as they do with `trybuild`. Keep the crate under test
-//!   warning-clean, or use [`Mode::Brief`].
-//! - **Cargo** suppresses any diagnostic whose message begins with `aborting
-//!   due to`, or ends with `warning emitted` or `warnings emitted`, before any
-//!   harness can see it -- that is how it strips rustc's own summary lines, and
-//!   a `compile_error!` worded any of those ways is stripped with them. If it is
-//!   the fixture's only error, the harness reports that rather than blessing an
-//!   empty golden. If the fixture has other errors too, they are blessed and the
-//!   suppressed one is silently absent, which nothing downstream of cargo can
-//!   detect. Word the message differently.
+//! - Fixtures compile under edition 2024 unless you call [`TestCases::edition`].
+//! - Warnings in the fixture itself land in its golden. Warnings from a path
+//!   dependency do not.
+//! - Do not word a `compile_error!` so it begins with `aborting due to` or ends
+//!   with `warning emitted` / `warnings emitted`. Cargo strips those before any
+//!   harness can see them.
+//! - Fixtures are built for the target the suite was built for, so goldens are
+//!   target-specific the same way they are toolchain-specific.
+//! - Install the `rust-src` component wherever goldens are blessed and checked.
+//!   Without it, a diagnostic pointing into the standard library renders
+//!   differently.
 //!
-//! # Concurrency
+//! Linux, macOS and Windows are supported, and a golden blessed on one matches
+//! on the others. Concurrent runs are safe: two `#[test]` functions each calling
+//! [`cases!`], `cargo nextest`, or two `cargo test` invocations at once
+//! serialize on a lock.
 //!
-//! Every fixture in a run is written into the same scratch project, so a run
-//! holds an exclusive lock on its scratch project and concurrent runs serialize.
-//! Two `#[test]` functions each calling [`cases!`] is safe, as is `cargo
-//! nextest` or two `cargo test` invocations at once -- without the lock they
-//! would compile each other's fixtures and report a broken fixture as passing.
+//! The reasoning behind these choices is in [DESIGN.md].
+//!
+//! [DESIGN.md]: https://github.com/stephenberry/nocompile/blob/main/DESIGN.md
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations)]
