@@ -38,7 +38,7 @@ not match a machine without it, or the reverse -- so this diff may be the \
 environment differing rather than the fixture. Install it wherever the goldens \
 are blessed and wherever they are checked (`rustup component add rust-src`; a \
 `--profile minimal` toolchain omits it). `Mode::Brief` narrows this but does not \
-close it.";
+close it; `Mode::BriefLocal` drops the spans into the standard library.";
 
 /// What a fixture is asserted to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

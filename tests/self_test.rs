@@ -682,6 +682,96 @@ fn a_declared_path_dependency_reaches_the_fixtures() {
     assert!(golden.contains("--> ui/misuses_helper.rs:2:22"), "{golden}");
 }
 
+/// A crate whose guard is a panic in a generic `const`, and whose `take`,
+/// which instantiates it, lives in `file`. rustc follows the panic with a note
+/// per step that led there, and the one naming `take` points at `file`.
+fn write_const_guard(sandbox: &Sandbox, file: &str) {
+    sandbox.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    );
+    let guard = "pub struct Width<const N: usize>;\n\
+                 impl<const N: usize> Width<N> {\n    \
+                 pub const OK: () = assert!(N < 64, \"N must be below 64\");\n}\n";
+    let take = "pub fn take<const N: usize>() {\n    let () = crate::Width::<N>::OK;\n}\n";
+    if file == "lib.rs" {
+        sandbox.write("helper/src/lib.rs", &format!("{guard}\n{take}"));
+    } else {
+        let module = file.trim_end_matches(".rs");
+        sandbox.write(&format!("helper/src/{file}"), take);
+        sandbox.write(
+            "helper/src/lib.rs",
+            &format!("{guard}\nmod {module};\npub use {module}::take;\n"),
+        );
+    }
+}
+
+/// `BriefLocal` exists for a crate under test that reorganizes itself: every
+/// span outside the fixture records which of its files a diagnostic passed
+/// through, and moving code between them re-blesses goldens that assert
+/// nothing about where it lives. This moves the function that instantiates
+/// the guard into a module of its own and requires the golden to hold.
+///
+/// Both halves are asserted, as for `elide_implementors`: the `BriefLocal`
+/// golden survives the move, and -- the premise, rather than an assumption --
+/// the same move breaks a `Brief` golden.
+#[test]
+fn a_brief_local_golden_survives_the_crate_under_test_moving_its_code() {
+    let sandbox = Sandbox::new("brief-local");
+    write_const_guard(&sandbox, "lib.rs");
+    sandbox.write(
+        "ui/too_wide.rs",
+        "fn main() {\n    helper::take::<70>();\n}\n",
+    );
+
+    let mut t = sandbox.cases();
+    t.dependency_path("helper", "helper");
+    t.compile_fail("ui/too_wide.rs").mode(Mode::BriefLocal);
+    assert_passed(&t.overwrite(true).run());
+    let golden = sandbox.read("ui/too_wide.stderr");
+    assert!(golden.contains("N must be below 64"), "{golden}");
+    assert!(
+        !golden.contains("helper/src"),
+        "a span outside the fixture reached the golden:\n{golden}"
+    );
+
+    write_const_guard(&sandbox, "take.rs");
+    assert_passed(&t.overwrite(false).run());
+
+    // The premise: the same move is a mismatch under `Brief`.
+    let mut brief = sandbox.cases();
+    brief.dependency_path("helper", "helper");
+    brief.compile_fail("ui/too_wide.rs").mode(Mode::Brief);
+    write_const_guard(&sandbox, "lib.rs");
+    assert_passed(&brief.overwrite(true).run());
+    write_const_guard(&sandbox, "take.rs");
+    let outcome = brief.overwrite(false).run();
+    let failure = sole_failure(&outcome);
+    assert!(
+        matches!(failure, Failure::Mismatch { .. }),
+        "expected the move to break the Brief golden, got {failure:?}"
+    );
+}
+
+/// `BriefLocal` must still catch a fixture that starts failing for a different
+/// reason, for the reason `Brief` must.
+#[test]
+fn brief_local_mode_still_catches_a_changed_error() {
+    let sandbox = Sandbox::new("brief-local-catches");
+    sandbox.write("ui/rejected.rs", REJECTED);
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/rejected.rs").mode(Mode::BriefLocal);
+    assert_passed(&t.overwrite(true).run());
+
+    sandbox.write(
+        "ui/rejected.rs",
+        "fn main() {\n    undefined_function();\n}\n",
+    );
+    let outcome = t.overwrite(false).run();
+    assert!(matches!(sole_failure(&outcome), Failure::Mismatch { .. }));
+}
+
 /// A crate with a trait, one implementor per name, and a bound that rejects
 /// anything else. rustc lists the implementors under a `= help:` heading,
 /// sorted, keeping only the first several.

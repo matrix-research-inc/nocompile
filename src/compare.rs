@@ -13,6 +13,8 @@
 use std::borrow::Cow;
 use std::fmt::{self, Display, Formatter};
 
+use crate::normalize::points_into;
+
 /// How a fixture's diagnostics are compared against its golden.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Mode {
@@ -58,6 +60,35 @@ pub enum Mode {
     /// golden also passes in `Brief` mode. Switching is therefore a one-line
     /// change, and blessing afterwards shrinks the golden to match.
     Brief,
+    /// [`Brief`](Mode::Brief), keeping only the span headers that point into the
+    /// fixture itself.
+    ///
+    /// A span into any other file -- the crate under test, a dependency, the
+    /// standard library -- has already lost its line number to normalization,
+    /// so what `Brief` still records of it is *which* files a diagnostic passes
+    /// through on its way. That is a fact about how the crate under test is
+    /// laid out, not about the fixture: a panic in a generic `const` is
+    /// followed by one note per constant and function that led to it, and a
+    /// refactor that moves one of them re-blesses every golden that reaches
+    /// it, with a diff that has nothing to do with what the fixture asserts.
+    /// The same argument as [`elide_implementors`](crate::TestCases::elide_implementors),
+    /// one step further out.
+    ///
+    /// What survives is every code, every primary message, and every span the
+    /// fixture's own author placed. A diagnostic whose only span is elsewhere
+    /// keeps its message and loses its location. So this still catches a
+    /// fixture that stops failing or fails for a different reason; what it no
+    /// longer notices is a note that starts or stops pointing at some other
+    /// file.
+    ///
+    /// It also takes the standard library out of the comparison. Without the
+    /// `rust-src` component rustc splits one annotated block into one span
+    /// header per annotation, and those headers point into the standard
+    /// library, so they are dropped with the rest.
+    ///
+    /// Filtered on both sides like `Brief`, so an `Exact` or `Brief` golden
+    /// passes unchanged after switching, and blessing shrinks it to match.
+    BriefLocal,
 }
 
 impl Display for Mode {
@@ -65,17 +96,40 @@ impl Display for Mode {
         f.write_str(match self {
             Mode::Exact => "Exact",
             Mode::Brief => "Brief",
+            Mode::BriefLocal => "BriefLocal",
         })
     }
 }
 
 /// Reduce `text` to what `mode` compares.
-pub(crate) fn filter(text: &str, mode: Mode) -> String {
+///
+/// `fixture` is the fixture's path relative to the host manifest directory,
+/// spelled as normalization writes it into a span header.
+pub(crate) fn filter(text: &str, mode: Mode, fixture: &str) -> String {
     let text = unify_line_endings(text);
     match mode {
         Mode::Exact => text.into_owned(),
         Mode::Brief => brief(&text),
+        Mode::BriefLocal => local(&brief(&text), fixture),
     }
+}
+
+/// Drop every span header from `brief` output that points outside `fixture`.
+///
+/// Taken after [`brief`] rather than folded into it, so `BriefLocal` is `Brief`
+/// minus a set of whole lines and cannot disagree with it about anything else.
+fn local(brief: &str, fixture: &str) -> String {
+    let mut out = String::with_capacity(brief.len());
+    for line in brief.lines() {
+        if let Some(target) = line.strip_prefix("--> ")
+            && !points_into(target, fixture)
+        {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Rewrite CRLF to LF, so a golden compares the same however git checked it out.
@@ -151,6 +205,10 @@ fn brief(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The fixture every rendering below was compiled from, as normalization
+    /// spells it in a span header.
+    const FIXTURE: &str = "tests/ui/a.rs";
+
     const RENDERED: &str = "\
 error[E0308]: mismatched types
   --> tests/ui/a.rs:4:17
@@ -171,27 +229,27 @@ error: aborting due to 1 previous error
 
     #[test]
     fn exact_is_the_identity() {
-        assert_eq!(filter(RENDERED, Mode::Exact), RENDERED);
+        assert_eq!(filter(RENDERED, Mode::Exact, FIXTURE), RENDERED);
     }
 
     #[test]
     fn brief_keeps_messages_and_spans_only() {
         assert_eq!(
-            filter(RENDERED, Mode::Brief),
+            filter(RENDERED, Mode::Brief, FIXTURE),
             "error[E0308]: mismatched types\n--> tests/ui/a.rs:4:17\nerror: aborting due to 1 previous error\n"
         );
     }
 
     #[test]
     fn brief_is_idempotent_so_filtering_both_sides_is_safe() {
-        let once = filter(RENDERED, Mode::Brief);
-        assert_eq!(filter(&once, Mode::Brief), once);
+        let once = filter(RENDERED, Mode::Brief, FIXTURE);
+        assert_eq!(filter(&once, Mode::Brief, FIXTURE), once);
     }
 
     #[test]
     fn brief_ignores_gutter_width() {
-        let narrow = filter("error: x\n --> a.rs:4:1\n", Mode::Brief);
-        let wide = filter("error: x\n     --> a.rs:4:1\n", Mode::Brief);
+        let narrow = filter("error: x\n --> a.rs:4:1\n", Mode::Brief, FIXTURE);
+        let wide = filter("error: x\n     --> a.rs:4:1\n", Mode::Brief, FIXTURE);
         assert_eq!(narrow, wide);
     }
 
@@ -213,7 +271,7 @@ error: MYLIB-E001: expected a struct with named fields
         // line compare equal, which for a macro reporting misuse is most of what
         // the golden was for.
         assert_eq!(
-            filter(MULTI_LINE, Mode::Brief),
+            filter(MULTI_LINE, Mode::Brief, FIXTURE),
             concat!(
                 "error: MYLIB-E001: expected a struct with named fields\n",
                 "       found a tuple struct\n",
@@ -224,8 +282,8 @@ error: MYLIB-E001: expected a struct with named fields
 
     #[test]
     fn brief_on_a_multi_line_message_is_idempotent() {
-        let once = filter(MULTI_LINE, Mode::Brief);
-        assert_eq!(filter(&once, Mode::Brief), once);
+        let once = filter(MULTI_LINE, Mode::Brief, FIXTURE);
+        assert_eq!(filter(&once, Mode::Brief, FIXTURE), once);
     }
 
     #[test]
@@ -233,7 +291,7 @@ error: MYLIB-E001: expected a struct with named fields
         // The snippet rows are indented too, and they are exactly what `Brief`
         // exists to drop. Only the run between the message and its span header
         // is the message.
-        assert!(!filter(MULTI_LINE, Mode::Brief).contains("derive_it!();"));
+        assert!(!filter(MULTI_LINE, Mode::Brief, FIXTURE).contains("derive_it!();"));
     }
 
     #[test]
@@ -241,7 +299,8 @@ error: MYLIB-E001: expected a struct with named fields
         assert_eq!(
             filter(
                 "warning: unused variable: `x`\n --> a.rs:2:9\n  |\n",
-                Mode::Brief
+                Mode::Brief,
+                FIXTURE,
             ),
             "warning: unused variable: `x`\n--> a.rs:2:9\n"
         );
@@ -249,7 +308,107 @@ error: MYLIB-E001: expected a struct with named fields
 
     #[test]
     fn brief_drops_indented_error_text_inside_a_snippet() {
-        assert_eq!(filter("   error: not a header\n", Mode::Brief), "");
+        assert_eq!(filter("   error: not a header\n", Mode::Brief, FIXTURE), "");
+    }
+
+    /// A panic in a generic `const`, as rustc renders it once something
+    /// instantiates the constant: the fixture's own span, then one note per
+    /// constant and function that led there, each in the crate under test.
+    const CONST_PANIC: &str = "\
+error[E0080]: evaluation panicked: a mark must be one of the first 64 fields
+  --> tests/ui/a.rs:18:1
+   |
+18 | declare!(Wide { #[mark] f64 });
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `Fields::<Wide>::MASK` failed here
+   |
+note: erroneous constant encountered
+  --> $DIR/src/traits.rs
+   |
+   |     const MASK: u64 = mask::<T>();
+   |                       ^^^^^^^^^^^
+note: the above error was encountered while instantiating `fn read::<Wide>`
+  --> $DIR/src/parser.rs
+   |
+   |         T::read(value, self)
+   |         ^^^^^^^^^^^^^^^^^^^^
+  ::: tests/ui/a.rs:20:5
+   |
+20 |     read::<Wide>(\"{}\");
+   |     ----------------------- in this call
+";
+
+    #[test]
+    fn brief_local_keeps_only_the_fixtures_own_spans() {
+        assert_eq!(
+            filter(CONST_PANIC, Mode::BriefLocal, FIXTURE),
+            concat!(
+                "error[E0080]: evaluation panicked: a mark must be one of the first 64 fields\n",
+                "--> tests/ui/a.rs:18:1\n",
+            )
+        );
+    }
+
+    /// The case the mode exists for: the crate under test reorders the notes,
+    /// which `Brief` records and this does not.
+    #[test]
+    fn brief_local_ignores_where_the_crate_under_test_keeps_its_code() {
+        let reordered = CONST_PANIC
+            .replace("$DIR/src/traits.rs", "$DIR/src/SWAP")
+            .replace("$DIR/src/parser.rs", "$DIR/src/traits.rs")
+            .replace("$DIR/src/SWAP", "$DIR/src/parser.rs");
+        assert_ne!(
+            filter(CONST_PANIC, Mode::Brief, FIXTURE),
+            filter(&reordered, Mode::Brief, FIXTURE)
+        );
+        assert_eq!(
+            filter(CONST_PANIC, Mode::BriefLocal, FIXTURE),
+            filter(&reordered, Mode::BriefLocal, FIXTURE)
+        );
+    }
+
+    /// Everything else `Brief` asserts, this asserts too.
+    #[test]
+    fn brief_local_still_sees_a_different_message_or_fixture_span() {
+        let local = |text: &str| filter(text, Mode::BriefLocal, FIXTURE);
+        assert_ne!(
+            local(CONST_PANIC),
+            local(&CONST_PANIC.replace("first 64", "first 63"))
+        );
+        assert_ne!(
+            local(CONST_PANIC),
+            local(&CONST_PANIC.replace("tests/ui/a.rs:18:1", "tests/ui/a.rs:19:1"))
+        );
+    }
+
+    /// A span into a different file whose name only starts like the fixture's
+    /// is someone else's, not the fixture's.
+    #[test]
+    fn brief_local_does_not_take_a_longer_name_for_the_fixture() {
+        assert_eq!(
+            filter(
+                "error: x\n --> tests/ui/a.rs.bak:1:1\n",
+                Mode::BriefLocal,
+                FIXTURE
+            ),
+            "error: x\n"
+        );
+    }
+
+    /// Filtering both sides is only safe if a filtered golden filters to itself.
+    #[test]
+    fn brief_local_is_idempotent() {
+        let once = filter(CONST_PANIC, Mode::BriefLocal, FIXTURE);
+        assert_eq!(filter(&once, Mode::BriefLocal, FIXTURE), once);
+    }
+
+    /// Switching from `Brief` needs no re-bless, as switching from `Exact` does not.
+    #[test]
+    fn brief_local_accepts_a_brief_golden() {
+        let brief = filter(CONST_PANIC, Mode::Brief, FIXTURE);
+        assert_eq!(
+            filter(&brief, Mode::BriefLocal, FIXTURE),
+            filter(CONST_PANIC, Mode::BriefLocal, FIXTURE)
+        );
     }
 
     #[test]
@@ -260,12 +419,12 @@ error: MYLIB-E001: expected a struct with named fields
     /// git on Windows hands back a golden the harness never wrote.
     #[test]
     fn crlf_line_endings_are_unified_before_comparison() {
-        assert_eq!(filter("a\r\nb\r\n", Mode::Exact), "a\nb\n");
+        assert_eq!(filter("a\r\nb\r\n", Mode::Exact, FIXTURE), "a\nb\n");
     }
 
     /// A lone `\r` is content, not a line ending, so it survives.
     #[test]
     fn a_bare_carriage_return_is_left_alone() {
-        assert_eq!(filter("a\rb\n", Mode::Exact), "a\rb\n");
+        assert_eq!(filter("a\rb\n", Mode::Exact, FIXTURE), "a\rb\n");
     }
 }
