@@ -169,9 +169,12 @@ And be honest about the size of the win: `trybuild` is a dev-dependency. It neve
 | Glob patterns | A directory or an explicit file covers every real use and costs no matcher. This is why `trybuild` needs `glob`. |
 | Inferring dependencies from the host manifest | The single biggest simplification, and also better behaviour — see below. |
 | `-Z` flags, nightly-only features | A compile-fail suite runs on the toolchain you invoke it with. If you need more, you need `trybuild`. |
-| Windows | Not in v1. Path normalization and the `\r\n` question need someone with a Windows machine to get right, and claiming support without testing it is worse than not claiming it. Note the separator mismatch is not merely cosmetic: the rule below that keeps line numbers only for the fixture's own spans would fail to recognise `src\main.rs` as the fixture and strip them from every span. The normalization is kept in one module so it is a contained addition later. |
 
 The moment a suite grows past what the host toolchain can express, `trybuild` is the answer and this crate would rather say so than grow toward it.
+
+### Platforms
+
+Linux, macOS and Windows. A golden blessed on one of those matches on the others. rustc spells a path with the platform's separator, so on Windows the paths the harness knows are folded to `/` before they are compared -- the scratch project, the manifest directory, `CARGO_HOME`, declared dependencies and the standard library -- and only those, since a `\` anywhere else may be an escape the fixture is about. A golden git checked out with CRLF line endings compares as the LF one the harness wrote. CI runs the whole suite on Windows, with and without `rust-src`, since each spells the standard library's paths differently.
 
 ### Speed
 

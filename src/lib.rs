@@ -98,10 +98,11 @@
 //! nightly-only features. The moment a suite needs any of those, `trybuild` is
 //! the answer. Fixtures *are* built for whatever target the suite itself was
 //! built for, so a `no_std` crate can test an invariant about its own target;
-//! goldens are target-specific in the same way they are toolchain-specific. Windows is not supported in
-//! v1 -- path normalization and the `\r\n` question need someone with a Windows
-//! machine to get right, and claiming support without testing it is worse than
-//! not claiming it.
+//! goldens are target-specific in the same way they are toolchain-specific.
+//!
+//! Linux, macOS and Windows are supported, and a golden blessed on one matches
+//! on the others: the paths the harness knows are folded to `/` separators, and
+//! a golden checked out with CRLF line endings compares as the LF one it wrote.
 //!
 //! # Requirements on fixtures
 //!

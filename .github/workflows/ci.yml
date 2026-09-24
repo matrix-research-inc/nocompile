@@ -19,7 +19,7 @@ env:
 # already on every runner.
 jobs:
   test:
-    name: ${{ matrix.os }} / ${{ matrix.toolchain }}
+    name: ${{ matrix.os }} / ${{ matrix.toolchain }}${{ matrix.components && format(' + {0}', matrix.components) || '' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -37,6 +37,19 @@ jobs:
             toolchain: "1.96.0"
           - os: macos-latest
             toolchain: stable
+          # Path separators, drive prefixes and CRLF checkouts are all
+          # Windows-only, and this is the one place they are exercised rather
+          # than reasoned about. Without `rust-src`, std spans arrive as the
+          # `/rustc/<commit>` prefix with a backslashed tail.
+          - os: windows-latest
+            toolchain: stable
+          # The same, with the standard library's source installed, as it is on
+          # a developer's machine for rust-analyzer. rustc then spells std
+          # paths through the rustup sysroot rather than `/rustc/<commit>`, and
+          # on Windows that path is backslashed from the drive letter on.
+          - os: windows-latest
+            toolchain: stable
+            components: rust-src
     steps:
       - uses: actions/checkout@v7
       - name: Install ${{ matrix.toolchain }}
@@ -44,9 +57,14 @@ jobs:
           rustup toolchain install ${{ matrix.toolchain }} --profile minimal
           rustup default ${{ matrix.toolchain }}
           rustc --version
+      - name: Add ${{ matrix.components }}
+        if: matrix.components
+        run: rustup component add ${{ matrix.components }}
       # Runs the unit tests, the adversarial self-test suite, the UI suite
-      # against its committed goldens, and the doctests.
-      - run: cargo test
+      # against its committed goldens, and the doctests. Every test binary runs
+      # even after one fails, so a platform-specific failure in the unit tests
+      # does not hide the ones in the suites after it.
+      - run: cargo test --no-fail-fast
 
   lint:
     runs-on: ubuntu-latest

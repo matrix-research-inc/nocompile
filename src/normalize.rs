@@ -337,12 +337,17 @@ impl Normalizer {
         // A rustup toolchain sits under neither `CARGO_HOME` nor the manifest
         // dir, so the sysroot is the one path that has to anchor itself. This
         // covers both of `replace_sysroot`'s markers, which share it as a prefix.
-        //
-        // `replace_rustc_commit`'s `/rustc/<hash>/` form deliberately gets no
-        // anchor: it is a virtual prefix rustc bakes in, spelled with `/` on
-        // every platform, so it never carries a separator that needs folding.
         const SYSROOT_MARKER: &str = "/lib/rustlib/src/rust/";
         if line.contains(SYSROOT_MARKER) {
+            return true;
+        }
+        // Without `rust-src`, the standard library's paths are the virtual
+        // `/rustc/<hash>/library` prefix rustc bakes in. That prefix is spelled
+        // with `/` everywhere, but what follows it is spelled with the
+        // platform's separator, so on Windows the line arrives as
+        // `/rustc/<hash>/library\core\src\panic.rs` and needs the fold like any
+        // other path. The prefix is a path by construction, so it anchors itself.
+        if find_rustc_commit(line).is_some() {
             return true;
         }
         if line.contains(&self.scratch_relative) {
@@ -1011,33 +1016,40 @@ fn path_start(line: &str, at: usize) -> usize {
 /// Self-delimiting, unlike the sysroot markers: the path starts at `/rustc/`, so
 /// there is nothing to walk back over.
 fn replace_rustc_commit(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some((start, end)) = find_rustc_commit(rest) {
+        out.push_str(&rest[..start]);
+        out.push_str(RUST);
+        out.push('/');
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Where the first `/rustc/<40 hex>/library/` in `text` starts, and where it
+/// ends.
+///
+/// The one statement of what that prefix looks like, so the rewrite and the
+/// fold's anchor cannot disagree about it.
+fn find_rustc_commit(text: &str) -> Option<(usize, usize)> {
     const PREFIX: &str = "/rustc/";
     const SUFFIX: &str = "/library/";
     const COMMIT_LEN: usize = 40;
 
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(at) = rest.find(PREFIX) {
-        let after = &rest[at + PREFIX.len()..];
-        let commit = after
-            .bytes()
-            .take_while(u8::is_ascii_hexdigit)
-            .count()
-            .min(after.len());
-
+    let mut from = 0;
+    while let Some(found) = text[from..].find(PREFIX) {
+        let start = from + found;
+        let after = &text[start + PREFIX.len()..];
+        let commit = after.bytes().take_while(u8::is_ascii_hexdigit).count();
         if commit == COMMIT_LEN && after[commit..].starts_with(SUFFIX) {
-            out.push_str(&rest[..at]);
-            out.push_str(RUST);
-            out.push('/');
-            rest = &after[commit + SUFFIX.len()..];
-        } else {
-            // Not a commit directory. Step past the prefix so the scan advances.
-            out.push_str(&rest[..at + PREFIX.len()]);
-            rest = after;
+            return Some((start, start + PREFIX.len() + commit + SUFFIX.len()));
         }
+        // Not a commit directory. Step past the prefix so the scan advances.
+        from = start + PREFIX.len();
     }
-    out.push_str(rest);
-    out
+    None
 }
 
 /// Rewrite `<cargo_home>/registry/src/<index>/` to `$CARGO_REGISTRY/`.
@@ -1847,6 +1859,26 @@ mod tests {
             "tests/ui/a.rs",
         );
         assert_eq!(out, " --> $RUST/core/src/mod.rs\n");
+    }
+
+    /// What Windows actually prints: the virtual prefix with `/`, and the rest
+    /// of the path with the platform's separator. Folded like any other path,
+    /// because the prefix anchors the line.
+    #[test]
+    fn rewrites_a_commit_path_whose_tail_uses_windows_separators() {
+        let out = normalizer().normalize(
+            " --> /rustc/0123456789abcdef0123456789abcdef01234567/library\\core\\src\\mod.rs:9:1\n",
+            "tests/ui/a.rs",
+        );
+        assert_eq!(out, " --> $RUST/core/src/mod.rs\n");
+    }
+
+    /// The prefix anchors only a real commit directory. A line that merely
+    /// mentions `/rustc/` keeps its backslashes, which may be escapes.
+    #[test]
+    fn a_line_without_a_commit_path_keeps_its_backslashes() {
+        let line = "error: unknown character escape: `\\d` in /rustc/short/library\n";
+        assert_eq!(normalizer().normalize(line, "tests/ui/a.rs"), line);
     }
 
     #[test]
