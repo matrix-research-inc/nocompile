@@ -466,7 +466,7 @@ fn span_target(line: &str) -> Option<&str> {
 }
 
 /// Whether a span target names the fixture rather than some other file.
-fn points_into(target: &str, fixture: &str) -> bool {
+pub(crate) fn points_into(target: &str, fixture: &str) -> bool {
     match target.strip_prefix(fixture) {
         Some(rest) => rest.is_empty() || rest.starts_with(':'),
         None => false,

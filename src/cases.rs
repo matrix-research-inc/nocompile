@@ -401,6 +401,7 @@ impl TestCases {
         let actual = compare::filter(
             &normalizer.normalize(&diagnostics, &case.relative),
             self.mode,
+            &case.relative,
         );
         if actual.trim().is_empty() {
             return Err(Failure::NoDiagnostics {
@@ -448,7 +449,7 @@ impl TestCases {
 
         // Both sides are filtered, so `Brief` mode accepts an `Exact` golden and
         // switching modes does not force a re-bless before the suite is green.
-        let expected = compare::filter(&expected, self.mode);
+        let expected = compare::filter(&expected, self.mode, &case.relative);
         if expected == actual {
             Ok(())
         } else {

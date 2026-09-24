@@ -38,6 +38,7 @@ Everything else is opt-in:
 
 ```rust
 t.mode(nocompile::Mode::Brief);                 // less brittle comparison, below
+t.mode(nocompile::Mode::BriefLocal);            // Brief, minus spans outside the fixture
 t.compile_fail("tests/ui/just_this_one.rs");
 t.pass_dir("tests/ui-pass");                  // fixtures that must still compile
 t.edition("2024");
@@ -88,9 +89,38 @@ What it drops is entirely rustc-rendering detail — source snippets, underline 
 
 The filter is applied to both sides of the comparison, so an existing `Exact` golden passes in `Brief` mode unchanged. Switching is a one-line change; blessing afterwards shrinks the goldens to match.
 
+### Only the fixture's own locations
+
+`Brief` keeps every span header, including the ones pointing outside the fixture. Normalization has already taken their line numbers, so what those record is *which files* of the crate under test a diagnostic passes through on its way. A panic in a generic `const` is the sharpest case: rustc follows it with a note for each constant and function that led there, so its `Brief` golden lists the crate's internals.
+
+```
+error[E0080]: evaluation panicked: N must be below 64
+--> $RUST/core/src/panic.rs
+--> $DIR/src/traits.rs
+--> $DIR/src/parser.rs
+--> tests/ui/too_wide.rs:18:1
+```
+
+Move one of those functions to another file, or reorder them, and the golden re-blesses with a diff that has nothing to do with what the fixture asserts. `BriefLocal` keeps only the spans that point into the fixture:
+
+```rust
+t.mode(nocompile::Mode::BriefLocal);
+```
+
+```
+error[E0080]: evaluation panicked: N must be below 64
+--> tests/ui/too_wide.rs:18:1
+```
+
+It is `Brief` minus whole lines, and nothing else changes: every code, every primary message and every span in the fixture is still compared. A diagnostic whose only span is elsewhere keeps its message and loses its location. What it gives up is noticing a note that starts or stops pointing at some other file. Like `Brief`, it filters both sides, so an existing golden passes unchanged after switching.
+
+It also drops the standard library from the comparison. The extra span headers rustc prints without the `rust-src` component ([below](#the-standard-librarys-source)) point into the standard library, so they go with the rest.
+
 ### Which mode
 
 **Use `Brief` when the goldens are committed and CI builds on more than one toolchain.** That describes most crates, and it is why this crate's own UI suite runs in `Brief`.
+
+**Use `BriefLocal` when the diagnostics reach into the crate under test**, as a const-evaluated guard's do, and that crate's internal layout should be free to change without re-blessing.
 
 **Use `Exact` when the rendering is the product** — a `#[diagnostic::on_unimplemented]` message, a `= help:` suggestion you wrote deliberately, a span you placed on purpose. `Brief` drops all three, so it cannot regression-test them.
 
@@ -159,7 +189,7 @@ And be honest about the size of the win: `trybuild` is a dev-dependency. It neve
 
 ## Scope
 
-**In:** `compile_fail` fixtures with `.stderr` goldens, `pass` fixtures, a bless mode, and the two comparison modes.
+**In:** `compile_fail` fixtures with `.stderr` goldens, `pass` fixtures, a bless mode, and the comparison modes.
 
 **Out, deliberately:**
 
@@ -220,7 +250,8 @@ So this is an environment requirement, not something the harness can hide:
 install `rust-src` wherever goldens are blessed and wherever they are checked.
 Most suites never meet it -- a fixture has to produce a span into the standard
 library at all -- and a mismatch that does say so in its failure message.
-`Mode::Brief` narrows the exposure without closing it.
+`Mode::Brief` narrows the exposure without closing it, and `Mode::BriefLocal`
+drops the spans into the standard library altogether.
 
 ## Requirements on fixtures
 

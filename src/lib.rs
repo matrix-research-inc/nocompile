@@ -45,6 +45,11 @@
 //! that stops failing, or starts failing for a different reason. On this crate's
 //! own UI suite it takes 33 golden lines down to 7.
 //!
+//! [`Mode::BriefLocal`] goes one step further and keeps only the span headers
+//! that point into the fixture. The others have already lost their line
+//! numbers, so they record only which files of the crate under test a
+//! diagnostic passed through, and a refactor of that crate re-blesses them.
+//!
 //! An `Exact` suite has one more lever, for the one part of a diagnostic the
 //! fixture does not control: [`TestCases::elide_implementors`] keeps the
 //! `= help:` heading that names a trait and replaces the list of its
