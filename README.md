@@ -51,7 +51,7 @@ One struct, eleven methods, two enums. That is the whole library.
 
 ## Living with toolchain churn
 
-`.stderr` goldens break whenever rustc reflows a diagnostic. That is inherent to golden-matching rendered text, and it is the worst property of this style of test. `nocompile` cannot fix it, but it offers a cheaper mode — the one axis on which it is _better_ than the alternative rather than merely lighter:
+`.stderr` goldens break whenever rustc reflows a diagnostic. That is inherent to golden-matching rendered text, and it is the worst property of this style of test. `nocompile` cannot fix it, but it offers a cheaper mode:
 
 ```rust
 t.mode(nocompile::Mode::Brief);
@@ -171,19 +171,22 @@ A crate whose selling point is "no dependencies" cannot have dev-dependencies ei
 
 ## Should you use this?
 
-**Probably not.** [`trybuild`] is the standard answer, it is battle-tested across thousands of crates, and it is more capable. This is not a criticism of it — it is a different point on the dependency/complexity curve.
+[`trybuild`] is the standard answer, battle-tested across thousands of crates, and the right one if you need what this crate deliberately leaves out ([Scope](#scope)): glob patterns, nightly-only flags, running the compiled program, or dependencies inferred from your manifest.
 
-Use `nocompile` if you keep a deliberately small dependency surface and currently pay a large one for a handful of compile-fail fixtures: `no_std`-adjacent crates, cryptography and safety-critical libraries, anything audited, anything embedded, anything whose pitch is its dependency tree. In one real workspace, `trybuild` was the only root of fifteen lock entries:
+For the core job, asserting that code fails to compile for the intended reason, `nocompile` is the stronger harness:
+
+- **It catches guards a check-only suite misses.** Fixtures are built, not checked, so a `const { assert!(...) }` inside a generic function actually fires. `trybuild` runs `cargo check` unless the suite also has a `pass` fixture, and then passes that fixture without asserting anything ([details](#build-not-check)).
+- **Its goldens survive toolchain upgrades.** `Mode::Brief` compares error codes, primary messages and spans, and drops the rendering rustc reflows between releases. `Mode::BriefLocal` also keeps the crate's internal file layout out of the goldens ([details](#living-with-toolchain-churn)). A `trybuild` golden is always the full rendering.
+- **Its goldens record only what the fixture is about.** A path dependency's own warnings stay with the dependency instead of being replayed into every fixture's golden, and implementor lists can be elided so that one new impl elsewhere does not re-bless unrelated tests ([details](#eliding-the-list)).
+- **Its fixtures see only what you declare,** not every dev-dependency of the host crate, so a fixture cannot quietly lean on something the invariant never mentions ([details](#declared-dependencies-not-inferred-ones)).
+- **Its goldens do not depend on your shell.** `RUSTFLAGS` and every `CARGO_PROFILE_*` variable are cleared for the fixture build, so an inherited `-D warnings` or `debug_assertions` override cannot change what a golden records ([details](#requirements-on-fixtures)).
+- **It adds nothing to your lockfile.** No dependencies, dev-dependencies included. In one real workspace, `trybuild` was the only root of fifteen lock entries:
 
 ```
 dissimilar  glob  serde  serde_derive  serde_json  target-triple  termcolor  toml
 ```
 
-Those are `trybuild`'s direct dependencies, from its published manifest; the transitive set is larger and pulls in a serialization stack and a TOML parser.
-
-How much of it actually leaves your lockfile is workspace-dependent — if you already depend on `serde` or `toml`, removing `trybuild` removes correspondingly fewer. Check your own with `cargo tree -i -p <crate>` before and after.
-
-And be honest about the size of the win: `trybuild` is a dev-dependency. It never ships and never enters a release binary. It costs lock entries, some test-build time, and an explanation when an audit asks why a compile-fail harness needs a serialization framework. If you do not track your dependency count, use `trybuild`.
+Those are `trybuild`'s direct dependencies, from its published manifest; the transitive set is larger and pulls in a serialization stack and a TOML parser. How much actually leaves your lockfile is workspace-dependent (if you already depend on `serde` or `toml`, correspondingly less). Check with `cargo tree -i -p <crate>` before and after. That matters most where the dependency tree is part of the pitch: `no_std`-adjacent crates, cryptography and safety-critical libraries, anything audited, anything embedded.
 
 [`trybuild`]: https://docs.rs/trybuild
 
