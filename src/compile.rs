@@ -487,15 +487,25 @@ mod tests {
         absorb(build, &message, Path::new(OURS));
     }
 
+    /// `text` as the inside of a JSON string, the way cargo writes it.
+    ///
+    /// A Windows manifest path is full of `\`, which is an escape on the wire,
+    /// so interpolating one raw is not the line cargo would have printed.
+    fn escaped(text: &str) -> String {
+        text.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    }
+
     fn message(manifest: &str, target: &str, level: &str, rendered: &str) -> String {
-        // The newlines in a rendered diagnostic are `\n` escapes on the wire.
-        let rendered = rendered.replace('\n', "\\n");
+        let (manifest, rendered) = (escaped(manifest), escaped(rendered));
         format!(
             r#"{{"reason":"compiler-message","manifest_path":"{manifest}","target":{{"name":"{target}"}},"message":{{"level":"{level}","rendered":"{rendered}"}}}}"#
         )
     }
 
     fn artifact(manifest: &str, target: &str) -> String {
+        let manifest = escaped(manifest);
         format!(
             r#"{{"reason":"compiler-artifact","manifest_path":"{manifest}","target":{{"name":"{target}"}}}}"#
         )

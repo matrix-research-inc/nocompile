@@ -51,7 +51,9 @@ jobs:
           rustc --version
       # Runs the unit tests, the adversarial self-test suite, the UI suite
       # against its committed goldens, and the doctests.
-      - run: cargo test
+      # Every test binary runs even after one fails, so a platform-specific
+      # failure in the unit tests does not hide the ones in the suites after it.
+      - run: cargo test --no-fail-fast
 
   lint:
     runs-on: ubuntu-latest
