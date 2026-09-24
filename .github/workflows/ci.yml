@@ -37,6 +37,11 @@ jobs:
             toolchain: "1.96.0"
           - os: macos-latest
             toolchain: stable
+          # Path separators, drive prefixes, CRLF checkouts and the rustup
+          # layout under `%USERPROFILE%` are all Windows-only, and this is the
+          # one place they are exercised rather than reasoned about.
+          - os: windows-latest
+            toolchain: stable
     steps:
       - uses: actions/checkout@v7
       - name: Install ${{ matrix.toolchain }}
