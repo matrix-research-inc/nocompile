@@ -208,6 +208,15 @@ fn a_golden_checked_out_with_crlf_still_matches() {
     sandbox.write("ui/rejected.stderr", &golden.replace('\n', "\r\n"));
 
     assert_passed(&t.overwrite(false).run());
+
+    // Nor does a bless see a change there to write or to report.
+    let outcome = t.overwrite(true).run();
+    assert_passed(&outcome);
+    assert_eq!(outcome.blessed().count(), 0, "{}", outcome.report());
+    assert_eq!(
+        sandbox.read("ui/rejected.stderr"),
+        golden.replace('\n', "\r\n")
+    );
 }
 
 /// A real difference is still caught when the golden arrives as CRLF: the
@@ -414,6 +423,62 @@ fn blessing_refuses_a_fixture_that_compiled() {
         !sandbox.path("ui/accepted.stderr").exists(),
         "bless wrote a golden for a fixture that compiled"
     );
+}
+
+/// A bless run says what it changed. A run that writes goldens and reports only
+/// that its cases passed looks exactly like an ordinary run, which is how a
+/// `NOCOMPILE=overwrite` left set in a script or a CI job goes unnoticed while
+/// the suite asserts nothing.
+///
+/// And it says only what it changed: a golden already holding what the fixture
+/// produces is not rewritten, so blessing a whole suite to settle one fixture
+/// lists that fixture and no other.
+#[test]
+fn a_bless_lists_the_goldens_it_wrote_and_only_those() {
+    let sandbox = Sandbox::new("bless-lists");
+    sandbox.write("ui/rejected.rs", REJECTED);
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/rejected.rs");
+
+    let outcome = t.overwrite(true).run();
+    assert_passed(&outcome);
+    assert_eq!(
+        outcome.blessed().collect::<Vec<_>>(),
+        [Path::new("ui/rejected.stderr")]
+    );
+    assert_eq!(
+        outcome.cases()[0].blessed(),
+        Some(Path::new("ui/rejected.stderr"))
+    );
+    assert_eq!(
+        outcome.report(),
+        "nocompile: 1 case(s) passed; 1 golden(s) written:\n    ui/rejected.stderr"
+    );
+    let golden = sandbox.read("ui/rejected.stderr");
+    assert!(
+        golden.contains("error[E0308]: mismatched types"),
+        "{golden}"
+    );
+    assert!(golden.contains("--> ui/rejected.rs:2:18"), "{golden}");
+
+    // Unchanged, so not rewritten and not listed.
+    let outcome = t.overwrite(true).run();
+    assert_passed(&outcome);
+    assert_eq!(outcome.blessed().count(), 0, "{}", outcome.report());
+    assert_eq!(outcome.report(), "nocompile: 1 case(s) passed");
+    assert_eq!(sandbox.read("ui/rejected.stderr"), golden);
+
+    // Written through a temporary file, which must not outlive the write.
+    let mut entries: Vec<String> = fs::read_dir(sandbox.path("ui"))
+        .expect("read fixture dir")
+        .map(|entry| {
+            let entry = entry.expect("read fixture dir entry");
+            entry.file_name().to_string_lossy().into_owned()
+        })
+        .collect();
+    entries.sort();
+    assert_eq!(entries, ["rejected.rs", "rejected.stderr"]);
 }
 
 /// A fixture is copied verbatim. The harness must not guess at adding a
@@ -742,12 +807,37 @@ fn a_missing_fixture_directory_is_reported() {
 
     let outcome = t.run();
     assert!(!outcome.is_success());
+    let report = outcome.report();
     assert!(
-        outcome
-            .report()
-            .contains("could not read the fixture directory does-not-exist"),
-        "{}",
-        outcome.report()
+        report.contains("could not read the fixture directory does-not-exist"),
+        "{report}"
+    );
+    // The verdict leads with what happened, not with a count of cases that
+    // never ran: `0 of 0 case(s) failed` reads as a pass.
+    assert!(
+        report.starts_with("nocompile: setup failed; no cases ran\n"),
+        "{report}"
+    );
+}
+
+/// A registration problem does not stop the fixtures that did register from
+/// running, and the verdict has to say both.
+#[test]
+fn a_setup_failure_beside_fixtures_that_ran_leads_the_report() {
+    let sandbox = Sandbox::new("setup-beside-cases");
+    sandbox.write("ui/accepted.rs", ACCEPTED);
+
+    let mut t = sandbox.cases();
+    t.compile_fail_dir("does-not-exist");
+    t.pass("ui/accepted.rs");
+
+    let outcome = t.overwrite(false).run();
+    assert!(!outcome.is_success());
+    assert_eq!(outcome.cases().len(), 1, "{}", outcome.report());
+    let report = outcome.report();
+    assert!(
+        report.starts_with("nocompile: setup failed; 0 of 1 case(s) failed\n"),
+        "{report}"
     );
 }
 
@@ -1790,5 +1880,17 @@ fn a_suppressed_wording_is_reported_the_same_way_beside_a_healthy_fixture() {
     assert!(
         sandbox.path("ui/healthy.stderr").exists(),
         "a healthy fixture beside a suppressed one was not blessed"
+    );
+    // And a failing run still says what it wrote.
+    assert_eq!(
+        outcome.blessed().collect::<Vec<_>>(),
+        [Path::new("ui/healthy.stderr")]
+    );
+    assert!(
+        outcome
+            .report()
+            .starts_with("nocompile: 1 of 2 case(s) failed; 1 golden(s) written:\n"),
+        "{}",
+        outcome.report()
     );
 }

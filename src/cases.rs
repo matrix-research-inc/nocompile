@@ -2,13 +2,17 @@
 
 use std::collections::HashSet;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
+use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::compare::{self, Mode};
 use crate::compile;
 use crate::normalize::{self, Normalizer};
-use crate::outcome::{CaseOutcome, Failure, Kind, Outcome};
+use crate::outcome::{CaseOutcome, Failure, Held, Kind, Outcome};
 use crate::path::lexical_join;
 use crate::scratch::{self, Dependency, Layout};
 
@@ -379,10 +383,26 @@ impl TestCases {
 
     /// Run every registered fixture and panic with a readable report if any did
     /// not hold up.
+    ///
+    /// A run that passes is silent, unless it wrote goldens: then the report,
+    /// which lists them, goes to stderr, so a bless run always says what it
+    /// changed.
     pub fn assert(&self) {
         let outcome = self.run();
         if !outcome.is_success() {
             panic!("\n{}\n", outcome.report());
+        }
+        if outcome.blessed().next().is_some() {
+            // Written to the stderr handle directly rather than through
+            // `eprintln!`. libtest captures the `print!` and `eprint!` families
+            // and shows what they wrote only for a test that fails, and a bless
+            // run passes -- so through the macro this report would be discarded
+            // on every run it exists for, and blessing would stay as silent as it
+            // was. The handle is not captured. A failure to write it is ignored
+            // deliberately: the goldens are written and the run passed, and
+            // failing a test because its own diagnostic output could not be
+            // shown would misreport the fixtures.
+            let _ = writeln!(io::stderr(), "\n{}\n", outcome.report());
         }
     }
 
@@ -463,7 +483,7 @@ impl TestCases {
         case: &Case,
         normalizer: &Normalizer,
         build: &compile::Build,
-    ) -> Result<(), Failure> {
+    ) -> Result<Held, Failure> {
         match case.kind {
             Kind::CompileFail => self.check_compile_fail(case, normalizer, build),
             Kind::Pass => self.check_pass(case, normalizer, build),
@@ -475,7 +495,7 @@ impl TestCases {
         case: &Case,
         normalizer: &Normalizer,
         build: &compile::Build,
-    ) -> Result<(), Failure> {
+    ) -> Result<Held, Failure> {
         // The most important failure the harness reports, and the reason it gets
         // its own message rather than a diff against an empty golden. Cargo
         // producing an artifact is the positive evidence; nothing else is.
@@ -506,12 +526,17 @@ impl TestCases {
         let golden = golden_path(&case.absolute);
         let golden_relative = golden_path(Path::new(&case.relative));
 
+        // Only reached once every check that could fail the case has passed,
+        // so nothing that failed is ever blessed. Which goldens were written is
+        // recorded for the report: a bless changes files the user is about to
+        // commit, and a run that did so without saying which is how a bless left
+        // on by accident goes unnoticed.
         if self.overwrite_requested() {
-            return fs::write(&golden, &actual).map_err(|error| {
-                io_failure(
-                    format!("could not write the golden {}", golden_relative.display()),
-                    error,
-                )
+            let written = write_golden(&golden, &golden_relative, &actual)?;
+            return Ok(if written {
+                Held::Blessed(golden_relative)
+            } else {
+                Held::Checked
             });
         }
 
@@ -537,7 +562,7 @@ impl TestCases {
         // switching modes does not force a re-bless before the suite is green.
         let expected = compare::filter(&expected, self.mode, &case.relative);
         if expected == actual {
-            Ok(())
+            Ok(Held::Checked)
         } else {
             Err(Failure::Mismatch {
                 golden: golden_relative,
@@ -553,11 +578,11 @@ impl TestCases {
         case: &Case,
         normalizer: &Normalizer,
         build: &compile::Build,
-    ) -> Result<(), Failure> {
+    ) -> Result<Held, Failure> {
         // An artifact is the assertion. Absence of diagnostics would not be:
         // a target cargo never got to has none either.
         if build.compiled(&case.bin) {
-            return Ok(());
+            return Ok(Held::Checked);
         }
         // Normalized even though there is no golden here, because the message
         // has to name the fixture the reader wrote rather than the scratch file
@@ -871,6 +896,95 @@ fn golden_path(fixture: &Path) -> PathBuf {
     fixture.with_extension("stderr")
 }
 
+/// Numbers the temporary files of golden writes within this process. The
+/// process id tells processes apart; this tells apart two writes in one
+/// process, which two runs on different threads can make at once.
+static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
+/// Write `contents` to the golden at `golden` unless it already holds that,
+/// and say whether it wrote. A missing golden holds nothing, so it is always
+/// written. `shown` is the golden's path as the report names it.
+///
+/// "Holds that" ignores CRLF against LF line endings, by the same unification
+/// the comparison applies. Git on Windows checks goldens out as CRLF, and
+/// neither git nor the comparison sees a difference there, so a byte-for-byte
+/// test would rewrite and list every golden of the suite on every bless while
+/// changing nothing anyone could commit. A golden left alone that way keeps
+/// its CRLF endings, which is what git expects of the checkout.
+///
+/// A golden that is not valid UTF-8 is merely different and gets replaced,
+/// rather than failing the one run that would fix it.
+///
+/// The write is atomic. The contents go to a temporary file beside the golden,
+/// which is then renamed over it, and a rename within one directory replaces
+/// its target in a single step on every supported platform. A run interrupted
+/// part way through therefore leaves the old golden or the new one, never a
+/// truncated one -- which a user who asked for a bless has every reason to
+/// commit. The temporary file is not synced before the rename: that would cost
+/// a full flush per golden to survive a power loss as well, and a golden torn
+/// that way fails loudly as a mismatch on the next run rather than passing.
+fn write_golden(golden: &Path, shown: &Path, contents: &str) -> Result<bool, Failure> {
+    match fs::read(golden) {
+        Ok(existing) => {
+            if let Ok(existing) = std::str::from_utf8(&existing)
+                && compare::unify_line_endings(existing) == compare::unify_line_endings(contents)
+            {
+                return Ok(false);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io_failure(
+                format!("could not read the golden {}", shown.display()),
+                error,
+            ));
+        }
+    }
+
+    // Beside the golden, because a rename is only atomic within one
+    // filesystem. Hidden and suffixed so that nothing mistakes it for a
+    // fixture or a golden, and named for the process and the write so that
+    // concurrent writers never share one. A file of this name left behind by a
+    // process that died can only be one of ours, so it is overwritten rather
+    // than refused.
+    let mut name = OsString::from(".");
+    name.push(golden.file_name().unwrap_or_default());
+    name.push(format!(
+        ".{}-{}.tmp",
+        process::id(),
+        NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temporary = golden.with_file_name(name);
+
+    let replaced = fs::write(&temporary, contents)
+        .map_err(|error| {
+            io_failure(
+                format!("could not write the golden {}", shown.display()),
+                error,
+            )
+        })
+        .and_then(|()| {
+            fs::rename(&temporary, golden).map_err(|error| {
+                io_failure(
+                    format!(
+                        "could not move the new golden into place at {}",
+                        shown.display()
+                    ),
+                    error,
+                )
+            })
+        });
+    if replaced.is_err() {
+        // Best effort, and deliberately so: the failure being returned is the
+        // one that says what went wrong, and the golden itself is untouched
+        // either way. A removal that fails too -- the write may never have
+        // created the file -- leaves at worst a hidden, recognizably named file
+        // beside the golden.
+        let _ = fs::remove_file(&temporary);
+    }
+    replaced.map(|()| true)
+}
+
 /// `path` as seen from `base`, with `/` separators. Falls back to the full path
 /// when it is not under `base`, which keeps the message useful rather than
 /// truncating it to a bare file name.
@@ -901,6 +1015,84 @@ mod tests {
             golden_path(Path::new("tests/ui/a.rs")),
             Path::new("tests/ui/a.stderr")
         );
+    }
+
+    /// Every file in `dir`, by name, sorted.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_golden_is_written_only_when_its_content_changes() {
+        let dir = std::env::temp_dir().join("nocompile-write-golden-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let golden = dir.join("a.stderr");
+        let shown = Path::new("ui/a.stderr");
+
+        // Missing, then unchanged, then changed.
+        assert!(write_golden(&golden, shown, "error: one\n").unwrap());
+        assert!(!write_golden(&golden, shown, "error: one\n").unwrap());
+        assert!(write_golden(&golden, shown, "error: two\n").unwrap());
+        assert_eq!(fs::read_to_string(&golden).unwrap(), "error: two\n");
+
+        // A golden that is not text is different, not an error.
+        fs::write(&golden, [0xff, 0xfe]).unwrap();
+        assert!(write_golden(&golden, shown, "error: two\n").unwrap());
+
+        // Checked out by git as CRLF: unchanged as far as git and the
+        // comparison are concerned, so neither rewritten nor listed.
+        fs::write(&golden, "error: two\r\n  --> ui/a.rs:1:1\r\n").unwrap();
+        assert!(!write_golden(&golden, shown, "error: two\n  --> ui/a.rs:1:1\n").unwrap());
+        assert_eq!(
+            fs::read_to_string(&golden).unwrap(),
+            "error: two\r\n  --> ui/a.rs:1:1\r\n"
+        );
+        // But a real difference under the CRLF is still one.
+        assert!(write_golden(&golden, shown, "error: three\n  --> ui/a.rs:1:1\n").unwrap());
+        assert_eq!(
+            fs::read_to_string(&golden).unwrap(),
+            "error: three\n  --> ui/a.rs:1:1\n"
+        );
+
+        // No temporary file outlives the write that made it.
+        assert_eq!(entries(&dir), ["a.stderr"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_golden_that_cannot_be_written_is_a_failure_naming_it() {
+        let dir = std::env::temp_dir().join("nocompile-write-golden-failure-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // The directory the golden belongs in does not exist.
+        let golden = dir.join("missing").join("a.stderr");
+        let failure = write_golden(&golden, Path::new("ui/a.stderr"), "error: one\n")
+            .expect_err("a golden with nowhere to go was reported as written");
+        let Failure::Io { context, .. } = &failure else {
+            panic!("expected Io, got {failure:?}");
+        };
+        assert_eq!(context, "could not write the golden ui/a.stderr");
+        assert!(entries(&dir).is_empty(), "{:?}", entries(&dir));
+
+        // Something is there, but it cannot be read as a golden. That is not a
+        // missing golden, and writing over it would hide whatever it is.
+        let golden = dir.join("a.stderr");
+        fs::create_dir_all(&golden).unwrap();
+        let failure = write_golden(&golden, Path::new("ui/a.stderr"), "error: one\n")
+            .expect_err("an unreadable golden was reported as written");
+        let Failure::Io { context, .. } = &failure else {
+            panic!("expected Io, got {failure:?}");
+        };
+        assert_eq!(context, "could not read the golden ui/a.stderr");
+        assert_eq!(entries(&dir), ["a.stderr"]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

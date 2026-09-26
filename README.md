@@ -32,7 +32,7 @@ tests/ui/rejects_union.rs
 tests/ui/rejects_union.stderr
 ```
 
-Write the goldens with `NOCOMPILE=overwrite cargo test`, then **read what they captured**. A missing golden is a failure rather than an implicit bless, so that step cannot be skipped.
+Write the goldens with `NOCOMPILE=overwrite cargo test`, then **read what they captured**. The run lists every golden it wrote, and writes only those whose content changed. A missing golden is a failure rather than an implicit bless, so that step cannot be skipped.
 
 Everything else is opt-in:
 
