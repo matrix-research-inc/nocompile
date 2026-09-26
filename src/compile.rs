@@ -148,6 +148,34 @@ fn profile_keys(keys: impl Iterator<Item = OsString>) -> Vec<OsString> {
 
 /// Build every bin target of the scratch project in one invocation.
 pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
+    let output = fixture_build(layout, env::vars_os().map(|(key, _)| key)).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut build = Build {
+        messages: HashMap::new(),
+        compiled: HashSet::new(),
+        foreign: Vec::new(),
+        other_manifests: BTreeSet::new(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        started: false,
+    };
+
+    ingest(&mut build, &stdout, &layout.manifest())?;
+    Ok(build)
+}
+
+/// The `cargo build` that compiles every fixture, ready to run.
+///
+/// Separate from [`build`] so that what the child is handed can be inspected
+/// without running it. The environment sweep below is a guarantee the README
+/// makes, and no fixture's outcome notices it missing on a machine whose shell
+/// sets none of the variables it removes, which is the usual one. So it is
+/// tested where it lives, on the `Command`.
+///
+/// `inherited` names the variables the child would otherwise inherit, which in
+/// [`build`] is this process's own. It is a parameter so that a test can supply
+/// an environment without `env::set_var`, which is `unsafe` in edition 2024 and
+/// would race every other test reading the environment.
+fn fixture_build(layout: &Layout, inherited: impl Iterator<Item = OsString>) -> Command {
     let mut command = Command::new(cargo());
 
     command
@@ -219,7 +247,7 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
     // was itself compiled for.
     //
     // Before the two set below, which the sweep would otherwise take with it.
-    for key in profile_keys(env::vars_os().map(|(key, _)| key)) {
+    for key in profile_keys(inherited) {
         command.env_remove(key);
     }
 
@@ -246,19 +274,7 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
         // has not changed, and within one fixture there is nothing to reuse.
         .env("CARGO_INCREMENTAL", "0");
 
-    let output = command.output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let mut build = Build {
-        messages: HashMap::new(),
-        compiled: HashSet::new(),
-        foreign: Vec::new(),
-        other_manifests: BTreeSet::new(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        started: false,
-    };
-
-    ingest(&mut build, &stdout, &layout.manifest())?;
-    Ok(build)
+    command
 }
 
 /// How a cargo message opens. Cargo puts `reason` first in every one it emits.
@@ -487,6 +503,8 @@ pub(crate) fn write_if_changed(path: &Path, contents: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn keys(names: &[&str]) -> Vec<String> {
@@ -537,6 +555,115 @@ mod tests {
             ])
             .is_empty()
         );
+    }
+
+    /// The fixture build as [`build`] would run it, in a process whose
+    /// environment holds exactly `inherited`.
+    fn fixture_build_inheriting(inherited: &[&str]) -> (Layout, Command) {
+        let layout = scratch_layout("fixture-build");
+        let command = fixture_build(&layout, inherited.iter().copied().map(OsString::from));
+        (layout, command)
+    }
+
+    /// Every change the command makes to the environment it inherits: `None`
+    /// for a variable removed, `Some` for one set. A variable it leaves alone is
+    /// absent, and so passes through as whatever the shell had.
+    fn environment(command: &Command) -> BTreeMap<String, Option<String>> {
+        command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    fn arguments(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The sweep, checked where it takes effect rather than in the list of names
+    /// it is computed from. Asserted whole: a variable this starts setting or
+    /// removing is a change to what the goldens depend on, and should have to
+    /// say so here.
+    #[test]
+    fn the_fixture_build_clears_every_inherited_flag_and_profile_key() {
+        let (_, command) = fixture_build_inheriting(&[
+            "PATH",
+            "RUSTFLAGS",
+            "CARGO_BUILD_RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_TARGET_DIR",
+            "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS",
+            "CARGO_PROFILE_DEV_OPT_LEVEL",
+            "CARGO_PROFILE_RELEASE_PANIC",
+            // Both inherited and set by the harness. The harness's setting is the
+            // one that must survive, which it does only if the sweep runs first.
+            "CARGO_PROFILE_DEV_DEBUG",
+            "CARGO_INCREMENTAL",
+        ]);
+
+        let removed = None;
+        let set = |value: &str| Some(value.to_string());
+        let expected = BTreeMap::from([
+            ("RUSTFLAGS".to_string(), removed.clone()),
+            ("CARGO_BUILD_RUSTFLAGS".to_string(), removed.clone()),
+            // Empty rather than removed: that is what overrides a discovered
+            // `[build] rustflags`.
+            ("CARGO_ENCODED_RUSTFLAGS".to_string(), set("")),
+            ("CARGO_TARGET_DIR".to_string(), removed.clone()),
+            (
+                "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS".to_string(),
+                removed.clone(),
+            ),
+            ("CARGO_PROFILE_DEV_OPT_LEVEL".to_string(), removed.clone()),
+            ("CARGO_PROFILE_RELEASE_PANIC".to_string(), removed.clone()),
+            ("CARGO_PROFILE_DEV_DEBUG".to_string(), set("none")),
+            ("CARGO_INCREMENTAL".to_string(), set("0")),
+        ]);
+        assert_eq!(environment(&command), expected);
+    }
+
+    /// The flags and variables a user's shell is most likely to carry are
+    /// cleared whether or not the harness saw them, so the guarantee does not
+    /// rest on the environment it was handed being complete.
+    #[test]
+    fn the_fixture_build_clears_flags_it_was_not_told_about() {
+        let (_, command) = fixture_build_inheriting(&[]);
+        let environment = environment(&command);
+        for key in ["RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "CARGO_TARGET_DIR"] {
+            assert_eq!(environment.get(key), Some(&None), "{key}");
+        }
+        assert_eq!(
+            environment.get("CARGO_ENCODED_RUSTFLAGS"),
+            Some(&Some(String::new()))
+        );
+    }
+
+    #[test]
+    fn the_fixture_build_compiles_every_fixture_into_the_scratch_target_dir() {
+        let (layout, command) = fixture_build_inheriting(&[]);
+        let manifest = layout.manifest();
+        let expected = [
+            "build",
+            "--bins",
+            "--keep-going",
+            "--message-format=json",
+            "--quiet",
+            "--color=never",
+            "--offline",
+            "--target-dir",
+            &layout.target.to_string_lossy(),
+            "--manifest-path",
+            &manifest.to_string_lossy(),
+        ];
+        assert_eq!(arguments(&command), expected);
+        assert_eq!(command.get_current_dir(), Some(layout.project.as_path()));
     }
 
     const OURS: &str = "/scratch/Cargo.toml";
