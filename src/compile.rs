@@ -252,6 +252,7 @@ fn fixture_build(
     // `CARGO_ENCODED_RUSTFLAGS` to the empty string is what actually overrides
     // that: it sits at the top of cargo's precedence order and an empty value
     // means "no flags" rather than "unset".
+    //
     // The scratch project's profile is this harness's to choose, the same as its
     // manifest is. Cargo reads `CARGO_PROFILE_<profile>_<key>` from the
     // environment, so an inherited `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false`
@@ -278,6 +279,18 @@ fn fixture_build(
     // the suite's target across: `cargo test --target <triple>` does not export
     // it, which is why the triple is passed as `--target` above whenever it is
     // not the host's, and the flag outranks the variable.
+    //
+    // The same line is drawn around what the toolchain *is*. `RUSTC_BOOTSTRAP`
+    // and `CARGO_UNSTABLE_*` are left alone, as `RUSTUP_TOOLCHAIN` is: they
+    // decide which compiler and which cargo features exist, not how this build
+    // uses them, and a crate that needs them to build at all -- `-Zbuild-std`
+    // for a target with no prebuilt standard library, say -- would find its
+    // fixtures unable to. So are the rustc wrappers (`RUSTC_WRAPPER`,
+    // `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`): a wrapper such as
+    // `sccache` is transparent by contract, and sweeping it would buy nothing
+    // but a cold cache on every run. A shell that sets any of these gets goldens
+    // that depend on it, the same way it gets goldens that depend on the
+    // toolchain it selects.
     //
     // Before the two set below, which the sweep would otherwise take with it.
     for key in profile_keys(inherited) {
@@ -692,6 +705,28 @@ mod tests {
             environment.get("CARGO_ENCODED_RUSTFLAGS"),
             Some(&Some(String::new()))
         );
+    }
+
+    /// The other side of the sweep's boundary: what selects the compiler, the
+    /// target, and the features they have is inherited untouched, so that the
+    /// fixtures build with the toolchain the crate under test does.
+    #[test]
+    fn the_fixture_build_leaves_the_toolchain_to_inherit() {
+        const TOOLCHAIN: [&str; 8] = [
+            "RUSTC",
+            "RUSTUP_TOOLCHAIN",
+            "CARGO_BUILD_TARGET",
+            "RUSTC_BOOTSTRAP",
+            "CARGO_UNSTABLE_BUILD_STD",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+        ];
+        let (_, command) = fixture_build_inheriting(&TOOLCHAIN);
+        let environment = environment(&command);
+        for key in TOOLCHAIN {
+            assert_eq!(environment.get(key), None, "{key}");
+        }
     }
 
     #[test]
