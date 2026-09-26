@@ -18,6 +18,7 @@ use std::fs::{File, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Condvar, Mutex, PoisonError};
 
 use crate::json;
 use crate::scratch::Layout;
@@ -501,13 +502,22 @@ pub(crate) fn host_lockfile(manifest_dir: &Path) -> io::Result<Option<PathBuf>> 
 /// functions each calling `nocompile::cases!()` hit it every time, and the
 /// symptom is a broken fixture reported as passing.
 ///
-/// The lock is held for the whole of a run and released when the returned file
-/// is dropped. It is taken on a file rather than an in-process mutex because the
-/// same hazard exists across processes -- `cargo nextest` runs test binaries
-/// concurrently, and nothing stops two `cargo test` invocations at once.
+/// The lock is held for the whole of a run and released when the returned
+/// guard is dropped. It has two levels, taken in order. Runs in this process
+/// queue on an in-process claim on the scratch root first, silently: a
+/// `#[test]` function waiting on its sibling is ordinary, and the test runner
+/// already shows that tests are running. Only then is the file lock taken,
+/// which is what covers the same hazard across processes -- `cargo nextest`
+/// runs test binaries concurrently, and nothing stops two `cargo test`
+/// invocations at once. Since this process's own runs never reach the file lock
+/// together, a wait there is always on another process, which is the wait
+/// nothing else would explain, and it says so once on stderr. See
+/// [`lock_file_reporting_waits`].
 ///
-/// A run that has to wait says so, once, on stderr. See [`lock_reporting_waits`].
-pub(crate) fn lock(layout: &Layout) -> io::Result<File> {
+/// The claim is per scratch root rather than one for the whole process: runs
+/// for different host packages share no scratch project, and serializing them
+/// would cost their parallelism for nothing.
+pub(crate) fn lock(layout: &Layout) -> io::Result<ScratchLock> {
     // `io::stderr()` rather than `eprintln!`: libtest captures what the `print`
     // family of macros writes from inside a test, and shows it only after the
     // test has finished, and only if it failed -- too late, and usually never,
@@ -516,14 +526,88 @@ pub(crate) fn lock(layout: &Layout) -> io::Result<File> {
     lock_reporting_waits(layout, &mut io::stderr())
 }
 
-/// [`lock`], writing the line that says a run is waiting to `notice`.
+/// [`lock`], writing the notice of a wait on another process to `notice`.
+fn lock_reporting_waits(layout: &Layout, notice: &mut impl Write) -> io::Result<ScratchLock> {
+    let claim = RootClaim::acquire(&layout.root);
+    let file = lock_file_reporting_waits(layout, notice)?;
+    Ok(ScratchLock {
+        file,
+        _claim: claim,
+    })
+}
+
+/// A run's hold on its scratch project. See [`lock`].
+pub(crate) struct ScratchLock {
+    file: File,
+    _claim: RootClaim,
+}
+
+impl Drop for ScratchLock {
+    /// Releases the file lock before the in-process claim, which is dropped
+    /// after this returns. The other order would let the next run in this
+    /// process find the file still locked, and announce a wait on another
+    /// process that does not exist.
+    fn drop(&mut self) {
+        // Closing the file releases the lock too, when the field is dropped just
+        // after this, so a failure here costs at most that spurious notice. It
+        // is explicit because Windows does not promise that closing a handle
+        // releases its locks promptly.
+        let _ = self.file.unlock();
+    }
+}
+
+/// The scratch roots a run in this process currently holds.
+static CLAIMED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// Signalled whenever a root is released from [`CLAIMED`].
+static RELEASED: Condvar = Condvar::new();
+
+/// This process's claim on one scratch root, released when dropped.
+///
+/// The set it lives in is only ever changed by a single `insert` or `remove`,
+/// so a panic on another thread cannot leave it half-updated, and a poisoned
+/// lock is recovered rather than propagated: poisoning here would otherwise
+/// turn one failing test into every later run in the process failing too.
+struct RootClaim {
+    root: PathBuf,
+}
+
+impl RootClaim {
+    fn acquire(root: &Path) -> Self {
+        let mut claimed = CLAIMED.lock().unwrap_or_else(PoisonError::into_inner);
+        while claimed.contains(root) {
+            claimed = RELEASED
+                .wait(claimed)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        claimed.insert(root.to_path_buf());
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for RootClaim {
+    fn drop(&mut self) {
+        CLAIMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.root);
+        // Every waiter rechecks its own root, so waking all of them is what
+        // lets the one for this root through, whichever it is.
+        RELEASED.notify_all();
+    }
+}
+
+/// The file level of [`lock`], writing the line that says a run is waiting to
+/// `notice`.
 ///
 /// The wait itself is correct, and deliberately unbounded: a run that gave up
 /// would have to fail, and a run behind a slow one is not failing. But a silent
 /// wait is indistinguishable from a slow fixture build, or a hang, so a run that
 /// is about to block says so first, naming the file it is waiting on. The lock
 /// is tried before anything is written, so an uncontended run stays quiet.
-fn lock_reporting_waits(layout: &Layout, notice: &mut impl Write) -> io::Result<File> {
+fn lock_file_reporting_waits(layout: &Layout, notice: &mut impl Write) -> io::Result<File> {
     std::fs::create_dir_all(&layout.root)?;
     let path = layout.root.join(".lock");
     let file = File::create(&path)?;
@@ -992,16 +1076,27 @@ mod tests {
         }
     }
 
-    /// A run that has to wait for the lock says so, naming the lock file, and
-    /// then waits rather than giving up. One that does not have to wait says
-    /// nothing: the notice is for a wait someone might otherwise mistake for a
-    /// hang, not for every run.
+    /// A run that has to wait on another process for the lock says so, naming
+    /// the lock file, and then waits rather than giving up. One that does not
+    /// have to wait says nothing: the notice is for a wait someone might
+    /// otherwise mistake for a hang, not for every run.
+    ///
+    /// The other process is played by a second handle on the lock file, which
+    /// contends exactly as one in another process would -- file locks belong to
+    /// the open file, not the process -- and which bypasses the in-process
+    /// claim, as another process's run does.
     #[test]
-    fn a_run_that_waits_for_the_lock_says_so_and_then_takes_it() {
+    fn a_run_that_waits_on_another_process_says_so_and_then_takes_it() {
         let layout = scratch_layout("lock-wait");
         let mut quiet = Vec::new();
-        let held = lock_reporting_waits(&layout, &mut quiet).expect("an uncontended lock");
+        drop(lock_reporting_waits(&layout, &mut quiet).expect("an uncontended lock"));
         assert!(quiet.is_empty(), "{}", String::from_utf8_lossy(&quiet));
+
+        let path = layout.root.join(".lock");
+        let other_process = File::create(&path).expect("open the lock file");
+        other_process
+            .lock()
+            .expect("lock it as another process would");
 
         let (sender, notices) = std::sync::mpsc::channel();
         let waiter = {
@@ -1014,12 +1109,17 @@ mod tests {
         // into a failure instead of a test that never ends, since the lock it is
         // blocked on is released only after this returns.
         let first = notices.recv_timeout(std::time::Duration::from_secs(60));
-        drop(held);
-        waiter
-            .join()
-            .expect("the waiting thread panicked")
-            .expect("the lock is taken once the first run releases it");
-        let first = first.expect("the second run did not say it was waiting for the lock");
+        other_process
+            .unlock()
+            .expect("release the other process's lock");
+        drop(other_process);
+        drop(
+            waiter
+                .join()
+                .expect("the waiting thread panicked")
+                .expect("the lock is taken once the other process releases it"),
+        );
+        let first = first.expect("the run did not say it was waiting for the lock");
 
         let notice: Vec<u8> = first
             .into_iter()
@@ -1029,9 +1129,53 @@ mod tests {
             String::from_utf8_lossy(&notice),
             format!(
                 "nocompile: waiting for another nocompile run to finish (lock file: {})\n",
-                layout.root.join(".lock").display()
+                path.display()
             )
         );
+    }
+
+    /// Two runs in one process -- two `#[test]` functions of one suite, the
+    /// ordinary case -- queue behind each other without a word. The second
+    /// must not get in while the first holds the lock, and must not announce
+    /// the wait: a sibling test is no mystery worth a line on stderr, and one
+    /// line per waiting test on every run is noise.
+    #[test]
+    fn runs_in_one_process_queue_silently() {
+        let layout = scratch_layout("lock-queue");
+        let mut quiet = Vec::new();
+        let held = lock_reporting_waits(&layout, &mut quiet).expect("an uncontended lock");
+
+        let (sender, notices) = std::sync::mpsc::channel();
+        let (acquired_sender, acquired) = std::sync::mpsc::channel();
+        let waiter = {
+            let layout = layout.clone();
+            std::thread::spawn(move || {
+                let lock = lock_reporting_waits(&layout, &mut Relay(sender));
+                let _ = acquired_sender.send(());
+                lock
+            })
+        };
+        // A window in which the second run has the chance to get in, or to
+        // announce a wait, and must do neither. It cannot make the test flaky
+        // in the passing direction: a correct lock keeps the waiter out however
+        // long the window is, and a slow machine can only make a broken one
+        // harder to catch.
+        assert!(
+            acquired
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "the second run took the lock while the first held it"
+        );
+        drop(held);
+        drop(
+            waiter
+                .join()
+                .expect("the waiting thread panicked")
+                .expect("the lock is taken once the first run releases it"),
+        );
+
+        let notice: Vec<u8> = notices.into_iter().flatten().collect();
+        assert!(notice.is_empty(), "{}", String::from_utf8_lossy(&notice));
     }
 
     /// Attribution compares manifest paths textually, so two spellings of one
