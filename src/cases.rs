@@ -568,10 +568,7 @@ impl TestCases {
     }
 
     fn overwrite_requested(&self) -> bool {
-        if let Some(overwrite) = self.overwrite {
-            return overwrite;
-        }
-        env::var(OVERWRITE_VAR).is_ok_and(|value| value.eq_ignore_ascii_case("overwrite"))
+        overwrite_from(self.overwrite, env::var(OVERWRITE_VAR).ok().as_deref())
     }
 
     fn push_file(&mut self, path: &Path, kind: Kind) {
@@ -851,6 +848,24 @@ fn io_failure(context: String, error: std::io::Error) -> Failure {
     }
 }
 
+/// Whether a run blesses, given the caller's [`TestCases::overwrite`] setting
+/// and the value of [`OVERWRITE_VAR`] (`None` when it is unset or not UTF-8).
+///
+/// An explicit setting wins in both directions, so a harness testing this one
+/// is not at the mercy of the shell that runs it. Otherwise only `overwrite`,
+/// in any case, blesses: a variable that merely happens to be set, or is set to
+/// something else, must not start rewriting a checkout's goldens.
+///
+/// Kept apart from the environment so the decision can be tested without
+/// setting a variable, which is `unsafe` in edition 2024 and racy besides:
+/// `cargo test` runs tests on parallel threads that share one environment.
+fn overwrite_from(explicit: Option<bool>, var: Option<&str>) -> bool {
+    match explicit {
+        Some(overwrite) => overwrite,
+        None => var.is_some_and(|value| value.eq_ignore_ascii_case("overwrite")),
+    }
+}
+
 /// The golden beside a fixture: the same path with a `.stderr` extension.
 fn golden_path(fixture: &Path) -> PathBuf {
     fixture.with_extension("stderr")
@@ -1090,14 +1105,46 @@ mod tests {
         assert_eq!(path.as_os_str().as_bytes(), b"/dep-\xff");
     }
 
+    /// The default is the `trybuild`-compatible one, and a golden blessed before
+    /// the option existed must not move until a suite opts in.
+    ///
+    /// Only the default is asserted here, because it is the one thing decided
+    /// in this file. What the flag does is the normalizer's, and is tested
+    /// there (the `eliding_*` tests, and `new_does_not_elide_implementors` for
+    /// its own default) and end to end in the self-test
+    /// `an_elided_implementor_list_survives_an_impl_added_to_the_crate_under_test`,
+    /// which also proves the premise by breaking an un-elided golden.
     #[test]
-    fn implementor_lists_are_elided_only_when_asked_for() {
-        // The default is the `trybuild`-compatible one, and a golden blessed
-        // before this option existed must not move until a suite opts in.
-        let mut t = TestCases::new("/w", "host");
-        assert!(!t.elide_implementors);
-        t.elide_implementors(true);
-        assert!(t.elide_implementors);
+    fn implementor_lists_are_not_elided_by_default() {
+        assert!(!TestCases::new("/w", "host").elide_implementors);
+    }
+
+    #[test]
+    fn the_overwrite_variable_blesses_in_any_case() {
+        for value in ["overwrite", "OVERWRITE", "Overwrite"] {
+            assert!(overwrite_from(None, Some(value)), "{value:?}");
+        }
+    }
+
+    /// A variable that happens to be set is not a request to rewrite goldens.
+    /// Only the documented value is, whole: near misses such as a trailing
+    /// space or a truthy value are as good as unset.
+    #[test]
+    fn any_other_value_or_no_variable_does_not_bless() {
+        assert!(!overwrite_from(None, None));
+        for value in ["", "1", "true", "yes", "overwrite ", "overwrites", "bless"] {
+            assert!(!overwrite_from(None, Some(value)), "{value:?}");
+        }
+    }
+
+    /// `overwrite(bool)` is documented as overriding the variable, and the
+    /// self-tests lean on that in both directions: a checking run must not
+    /// bless because the shell it runs in happens to say so.
+    #[test]
+    fn an_explicit_setting_outranks_the_variable_either_way() {
+        assert!(!overwrite_from(Some(false), Some("overwrite")));
+        assert!(overwrite_from(Some(true), None));
+        assert!(overwrite_from(Some(true), Some("no")));
     }
 
     /// A member's scratch project is seeded with its workspace's lockfile, not a
@@ -1105,7 +1152,14 @@ mod tests {
     /// none to seed.
     #[test]
     fn the_scratch_project_takes_the_host_workspace_lockfile() {
-        let dir = std::env::temp_dir().join("nocompile-lockfile-test");
+        // In the system temp directory rather than under the target directory
+        // like the rest of this crate's scratch state, because the `bare` host
+        // below must have no cargo project above it: under `target/` cargo
+        // would find this crate's own manifest, and seed its lockfile. Named
+        // per process so two concurrent test runs cannot remove each other's
+        // directory mid-test.
+        let dir =
+            std::env::temp_dir().join(format!("nocompile-lockfile-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let write = |relative: &str, contents: &str| {
             let path = dir.join(relative);
@@ -1144,7 +1198,14 @@ mod tests {
 
     #[test]
     fn fixtures_are_registered_in_file_name_order() {
-        let dir = std::env::temp_dir().join("nocompile-order-test");
+        // Under the target directory, where the rest of this crate's scratch
+        // state lives, and named for this test because `cargo test` runs tests
+        // in parallel. Nothing here asks cargo anything, so unlike the lockfile
+        // test above there is no reason to leave the build's own tree.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("nocompile-unittest")
+            .join("registration-order");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("ui")).unwrap();
         for name in ["c.rs", "a.rs", "b.rs", "ignored.txt"] {
@@ -1154,6 +1215,5 @@ mod tests {
         t.compile_fail_dir("ui");
         let names: Vec<&str> = t.cases.iter().map(|c| c.relative.as_str()).collect();
         assert_eq!(names, ["ui/a.rs", "ui/b.rs", "ui/c.rs"]);
-        let _ = fs::remove_dir_all(&dir);
     }
 }

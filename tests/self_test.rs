@@ -13,12 +13,15 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use nocompile::{Failure, Mode, Outcome, TestCases};
 
 /// A throwaway host crate: a directory of fixtures the test owns outright.
 struct Sandbox {
-    name: String,
+    /// The host package name handed to the harness, which is what names its
+    /// scratch project.
+    package: String,
     dir: PathBuf,
 }
 
@@ -26,8 +29,18 @@ impl Sandbox {
     /// `name` must be unique per test: it names both the sandbox directory and
     /// the harness's scratch project, and `cargo test` runs tests in parallel.
     fn new(name: &str) -> Self {
+        Self::sharing_package(name, name)
+    }
+
+    /// A sandbox of its own, `name`, posing as the host package `package`.
+    ///
+    /// The scratch project is named by the host package rather than by where the
+    /// host lives, so sandboxes built with one `package` share one scratch
+    /// project, as two test binaries of one crate do. Only a test that wants
+    /// exactly that should reach for this.
+    fn sharing_package(name: &str, package: &str) -> Self {
         Sandbox {
-            name: name.to_string(),
+            package: package.to_string(),
             dir: fresh_dir(name),
         }
     }
@@ -49,7 +62,7 @@ impl Sandbox {
     }
 
     fn cases(&self) -> TestCases {
-        TestCases::new(&self.dir, &self.name)
+        TestCases::new(&self.dir, &self.package)
     }
 }
 
@@ -352,6 +365,38 @@ fn a_pass_fixture_that_compiles_passes() {
     assert_passed(&t.overwrite(false).run());
 }
 
+/// `edition` reaches the compiler, and the default is 2024.
+///
+/// There is no host manifest to read an edition from, so a crate on an older
+/// one has to say so, and a mismatch does not error: the fixture just compiles
+/// under other rules. `gen` is an ordinary identifier in 2021 and a reserved
+/// keyword from 2024, so whether this fixture compiles depends on nothing but
+/// this setting -- the hazard the README warns about, in its plainest form.
+#[test]
+fn the_edition_decides_what_a_fixture_compiles_under() {
+    let sandbox = Sandbox::new("edition");
+    sandbox.write(
+        "ui/gen_as_identifier.rs",
+        "fn main() {\n    let gen: u8 = 0;\n    let _ = gen;\n}\n",
+    );
+
+    let mut t = sandbox.cases();
+    t.pass("ui/gen_as_identifier.rs").overwrite(false);
+    assert_passed(&t.edition("2021").run());
+
+    // A fresh `TestCases`, so the edition is the default rather than 2021.
+    let mut t = sandbox.cases();
+    t.pass("ui/gen_as_identifier.rs").overwrite(false);
+    let outcome = t.run();
+    let Failure::DidNotCompile { stderr } = sole_failure(&outcome) else {
+        panic!("expected DidNotCompile:\n{}", outcome.report());
+    };
+    assert!(
+        stderr.contains("reserved keyword `gen`"),
+        "the fixture failed under 2024 for some other reason:\n{stderr}"
+    );
+}
+
 /// Blessing must never write a golden for a fixture that compiled: there is no
 /// stderr to write, and an empty golden makes the fixture permanently and
 /// silently useless.
@@ -497,9 +542,15 @@ fn a_suite_that_registers_nothing_is_reported() {
 }
 
 /// Every fixture in a run is written into the same scratch project, and
-/// `cargo test` runs test functions in parallel threads. Without a lock the two
-/// runs below compile each other's fixtures, and the reliable symptom is a
-/// broken fixture reported as passing.
+/// `cargo test` runs test functions in parallel threads. Each run also rewrites
+/// the manifest that says which bins cargo builds, so without a lock one run
+/// builds under the other's manifest, and a fixture is left out of the very
+/// build meant to compile it: the reliable symptom here is the fine fixture
+/// reported as not compiling.
+///
+/// This pins the lock, and only that. The two fixtures have different paths
+/// and so different bins, so one run can never be handed the other's artifact;
+/// the next test is the one that could be.
 #[test]
 fn concurrent_runs_do_not_compile_each_others_fixtures() {
     const ROUNDS: usize = 8;
@@ -523,6 +574,57 @@ fn concurrent_runs_do_not_compile_each_others_fixtures() {
             for _ in 0..ROUNDS {
                 let mut t = sandbox.cases();
                 t.pass("fine/fixture.rs").overwrite(false);
+                assert_passed(&t.run());
+            }
+        });
+        broken.join().expect("broken thread");
+        fine.join().expect("fine thread");
+    });
+}
+
+/// The collision the lock exists for, in its dangerous shape: two hosts that
+/// share a package name, and so a scratch project, each registering the same
+/// relative path with different contents. One path is one bin, so the two runs
+/// write one source file and read one artifact. Were they to interleave, the
+/// broken run could build the fine run's source, or be handed the artifact the
+/// fine run left behind, and report a fixture that cannot compile as passing:
+/// a failure that is green, which is the one a compile-fail suite must never
+/// produce.
+///
+/// Serialized, each run still follows the other's build of the same bin, so
+/// this also pins that a run's verdict comes from its own build of its own
+/// source rather than from what the previous run left in the target directory.
+#[test]
+fn concurrent_runs_of_one_fixture_path_keep_their_own_verdicts() {
+    // Each round alternates the one bin between two sources and relinks it,
+    // so rounds cost more than in the test above. Without the lock this fails
+    // reliably within four; more would only add to the suite's runtime.
+    const ROUNDS: usize = 4;
+    const PACKAGE: &str = "concurrent-same-path";
+    const FIXTURE: &str = "ui/fixture.rs";
+
+    let broken_host = Sandbox::sharing_package("concurrent-same-path-broken", PACKAGE);
+    let fine_host = Sandbox::sharing_package("concurrent-same-path-fine", PACKAGE);
+    broken_host.write(FIXTURE, REJECTED);
+    fine_host.write(FIXTURE, ACCEPTED);
+
+    std::thread::scope(|scope| {
+        let broken = scope.spawn(|| {
+            for _ in 0..ROUNDS {
+                let mut t = broken_host.cases();
+                t.pass(FIXTURE).overwrite(false);
+                let outcome = t.run();
+                let failure = sole_failure(&outcome);
+                assert!(
+                    matches!(failure, Failure::DidNotCompile { .. }),
+                    "a fixture that cannot compile took another run's verdict: {failure:?}"
+                );
+            }
+        });
+        let fine = scope.spawn(|| {
+            for _ in 0..ROUNDS {
+                let mut t = fine_host.cases();
+                t.pass(FIXTURE).overwrite(false);
                 assert_passed(&t.run());
             }
         });
@@ -1179,6 +1281,46 @@ fn all_cases_are_reported_not_just_the_first_failure() {
     assert!(report.contains("FAIL ui/b.rs (compile_fail)"), "{report}");
 }
 
+/// One failing fixture must not stop the others being built.
+///
+/// Left to itself, cargo stops scheduling targets after the first one fails, so
+/// with more failing fixtures than it runs at once, those it never started
+/// would have no diagnostics -- and a target cargo never built is
+/// indistinguishable from one that compiled without a word. `--keep-going` is
+/// what prevents that, and this is the test that fails without it: every
+/// fixture fails, and there are more of them than cargo's default job count,
+/// which is the machine's available parallelism.
+#[test]
+fn every_failing_fixture_is_built_even_past_the_parallelism_width() {
+    let sandbox = Sandbox::new("keep-going");
+    let width = std::thread::available_parallelism().map_or(1, usize::from);
+    // Zero-padded so file-name order, which is registration order, is numeric.
+    let fixtures: Vec<String> = (0..width + 2)
+        .map(|i| format!("ui/fails_{i:03}.rs"))
+        .collect();
+    for fixture in &fixtures {
+        sandbox.write(fixture, REJECTED);
+    }
+
+    let mut t = sandbox.cases();
+    t.compile_fail_dir("ui");
+    let outcome = t.overwrite(true).run();
+    // A fixture left unbuilt would be a `NoDiagnostics` failure here, reported
+    // with the rest of the run.
+    assert_passed(&outcome);
+    assert_eq!(outcome.cases().len(), fixtures.len());
+
+    // And each golden is that fixture's own diagnostic, not merely a golden.
+    for fixture in &fixtures {
+        let golden = sandbox.read(&fixture.replace(".rs", ".stderr"));
+        assert!(
+            golden.contains("error[E0308]: mismatched types")
+                && golden.contains(&format!("--> {fixture}:2:18")),
+            "{fixture} was not blessed from its own diagnostic:\n{golden}"
+        );
+    }
+}
+
 /// `assert` panics with the report rather than a bare assertion failure.
 #[test]
 fn assert_panics_with_the_report() {
@@ -1227,7 +1369,11 @@ fn a_cargo_failure_is_not_reported_as_a_diagnostic() {
     let Failure::Cargo { message } = &outcome.setup_failures()[0] else {
         panic!("expected Cargo, got {:?}", outcome.setup_failures()[0]);
     };
-    assert!(message.contains("expected `=`"), "{message}");
+    // Cargo's message points the reader at the manifest it could not parse.
+    // Its wording is the TOML parser's and not this harness's to pin, and cargo
+    // has spelled the path both absolutely and relative to its working
+    // directory, so only the file name is asserted.
+    assert!(message.contains("Cargo.toml"), "{message}");
     assert!(
         !sandbox.path("ui/rejected.stderr").exists() && !sandbox.path("ui/other.stderr").exists(),
         "bless wrote a golden from a manifest cargo could not parse"
@@ -1345,18 +1491,54 @@ fn a_diagnostic_reaching_into_the_standard_library_is_portable() {
 /// every rebuild, so the same warning lands in every golden and the suite churns
 /// whenever the dependency does. Attribution by target removes the problem
 /// rather than documenting it.
+///
+/// The premise is established first rather than assumed: the helper is built on
+/// its own and must warn. Without that, every assertion below is a negative one,
+/// and a lint renamed or a rustc that stopped firing it would leave the test
+/// green while asserting nothing.
 #[test]
 fn a_dependency_warning_does_not_reach_a_fixtures_golden() {
     let sandbox = Sandbox::new("dependency-warning");
+    // Its own workspace, so building it directly cannot be absorbed by some
+    // workspace above the target directory. Cargo ignores the table once the
+    // helper is a path dependency of the scratch project.
     sandbox.write(
         "helper/Cargo.toml",
-        "[package]\nname = \"helper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        "[workspace]\n\n[package]\nname = \"helper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
     );
     // `unused_variables` fires here, in the dependency.
     sandbox.write(
         "helper/src/lib.rs",
         "pub fn small() -> u8 {\n    let unused = 1;\n    0\n}\n",
     );
+
+    // The same cargo as the harness, with the same empty rustflags, so an
+    // `-A warnings` in the shell's `RUSTFLAGS` cannot hide the warning from
+    // this check while the harness, which clears it, would still see it.
+    let premise = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .args([
+            "build",
+            "--offline",
+            "--color=never",
+            "--message-format=short",
+        ])
+        .arg("--manifest-path")
+        .arg(sandbox.path("helper/Cargo.toml"))
+        .arg("--target-dir")
+        .arg(sandbox.path("helper-target"))
+        .env("CARGO_ENCODED_RUSTFLAGS", "")
+        .output()
+        .expect("run cargo on the helper");
+    let stderr = String::from_utf8_lossy(&premise.stderr);
+    assert!(
+        premise.status.success(),
+        "the helper does not build:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unused variable: `unused`"),
+        "the helper no longer warns, so this test would assert nothing:\n{stderr}"
+    );
+
     sandbox.write(
         "ui/misuses_helper.rs",
         "fn main() {\n    let _x: String = helper::small();\n}\n",
