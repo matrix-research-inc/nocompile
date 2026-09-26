@@ -111,6 +111,7 @@ If a suite outgrows these limits, `trybuild` is the answer; this crate would rat
 **Fixtures**
 
 - A fixture is built as a bin and compiled verbatim, so it must define `fn main`, as `trybuild` fixtures do. Without one you get a plain `E0601`.
+- Registering a directory is not recursive. Every `.rs` file under a registered directory must itself be registered, and every `.stderr` there must be the golden of a registered `compile_fail` fixture; anything else fails the run.
 - Fixtures build with `--offline`, so a dependency must be a path dependency or already in the local cargo cache.
 - Fixtures compile under edition 2024 unless you call `t.edition(...)`. A mismatch with your crate does not error; it changes what the goldens record.
 - Warnings in the fixture itself land in its golden. Warnings from a path dependency do not.

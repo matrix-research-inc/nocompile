@@ -116,6 +116,24 @@ pub(crate) const OTHERS: &str = "$N";
 /// Placeholder for an implementor list the harness elided in full.
 pub(crate) const IMPLEMENTORS: &str = "$IMPLEMENTORS";
 
+/// Every placeholder above: the ones a dependency's own must not spell.
+///
+/// A dependency whose placeholder matched one of these would render a path into
+/// it exactly as the thing the fixed placeholder stands for, and a golden could
+/// no longer say which was meant. `TestCases::dependency_path` refuses such a
+/// name against this list, so a placeholder added above belongs here too, and
+/// in the list of refused names that method documents.
+pub(crate) const RESERVED: [&str; 8] = [
+    DIR,
+    SCRATCH,
+    CARGO_REGISTRY,
+    CARGO_HOME,
+    RUST,
+    CRATE,
+    OTHERS,
+    IMPLEMENTORS,
+];
+
 /// The path rewrites for one fixture.
 ///
 /// Built per fixture rather than per run, because two of its fields name the
@@ -443,7 +461,11 @@ fn ends_component(after: Option<char>) -> bool {
 /// collision: `a-b` and `a_b` produce the same placeholder. Declaring both is
 /// vanishingly rare and the result is still portable, just ambiguous, which is
 /// not worth diverging from the spelling a migrating golden already contains.
-fn placeholder(name: &str) -> String {
+///
+/// A collision with one of the fixed placeholders is a different matter, since
+/// it makes a dependency indistinguishable from something that is not a
+/// dependency at all. That one is refused at registration; see [`RESERVED`].
+pub(crate) fn placeholder(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 1);
     out.push('$');
     for ch in name.chars() {
@@ -1298,6 +1320,19 @@ mod tests {
     fn dependency_placeholders_uppercase_and_underscore_the_name() {
         assert_eq!(placeholder("my-core"), "$MY_CORE");
         assert_eq!(placeholder("core"), "$CORE");
+    }
+
+    /// Every reserved placeholder is one some dependency name would produce, so
+    /// refusing names against the list refuses exactly the colliding ones -- and
+    /// a `-` spelling collides as well as a `_` one.
+    #[test]
+    fn every_reserved_placeholder_is_one_a_dependency_name_can_spell() {
+        for reserved in RESERVED {
+            let name = reserved[1..].to_ascii_lowercase();
+            assert_eq!(placeholder(&name), reserved);
+            assert_eq!(placeholder(&name.replace('_', "-")), reserved);
+        }
+        assert!(!RESERVED.contains(&placeholder("my-core").as_str()));
     }
 
     #[test]
