@@ -747,6 +747,59 @@ fn brief_mode_still_catches_a_changed_error() {
     assert!(matches!(sole_failure(&outcome), Failure::Mismatch { .. }));
 }
 
+/// `Brief` compares a message whole, past a blank line its author put in it.
+///
+/// rustc pads that line like the rest of the message and normalization trims
+/// the padding, leaving it spelled like the blank that ends a diagnostic. This
+/// is what pins the two to agreeing on a real diagnostic rather than on a
+/// rendering written out by hand.
+#[test]
+fn brief_mode_catches_a_change_after_a_blank_line_in_a_message() {
+    let sandbox = Sandbox::new("brief-blank-line");
+    let fixture =
+        |tail: &str| format!("compile_error!(\"line one\\n\\nline {tail}\");\n\nfn main() {{}}\n");
+    sandbox.write("ui/paragraphs.rs", &fixture("three"));
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/paragraphs.rs").mode(Mode::Brief);
+    assert_passed(&t.overwrite(true).run());
+    let golden = sandbox.read("ui/paragraphs.stderr");
+    assert!(
+        golden.contains("error: line one\n\n       line three\n"),
+        "the message was cut at its blank line:\n{golden}"
+    );
+
+    sandbox.write("ui/paragraphs.rs", &fixture("four"));
+    let outcome = t.overwrite(false).run();
+    assert!(matches!(sole_failure(&outcome), Failure::Mismatch { .. }));
+}
+
+/// A line of a message may begin with `--> `, and it is still the message.
+///
+/// `BriefLocal` drops every span header pointing outside the fixture, so
+/// reading that line as one would delete it from both sides and a change to
+/// it would pass.
+#[test]
+fn brief_local_mode_catches_a_change_to_a_message_line_beginning_with_an_arrow() {
+    let sandbox = Sandbox::new("brief-local-arrow");
+    let fixture =
+        |tail: &str| format!("compile_error!(\"head\\n--> {tail}\");\n\nfn main() {{}}\n");
+    sandbox.write("ui/arrow.rs", &fixture("not a span"));
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/arrow.rs").mode(Mode::BriefLocal);
+    assert_passed(&t.overwrite(true).run());
+    let golden = sandbox.read("ui/arrow.stderr");
+    assert!(
+        golden.contains("error: head\n       --> not a span\n--> ui/arrow.rs:1:1\n"),
+        "the message line was read as a span header:\n{golden}"
+    );
+
+    sandbox.write("ui/arrow.rs", &fixture("something else"));
+    let outcome = t.overwrite(false).run();
+    assert!(matches!(sole_failure(&outcome), Failure::Mismatch { .. }));
+}
+
 /// Directory registration takes every `.rs` file, in file-name order, and pairs
 /// each with the golden beside it.
 #[test]
