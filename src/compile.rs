@@ -261,9 +261,14 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
     Ok(build)
 }
 
-/// How a cargo message opens. Cargo puts `reason` first in every one it emits,
-/// and this is only used to find a message that is *not* at the start of its
-/// line, so a false negative costs nothing that was not already lost.
+/// How a cargo message opens. Cargo puts `reason` first in every one it emits.
+///
+/// This, rather than a leading brace, is what marks a line as cargo's own.
+/// Anything else a line can start with -- a proc macro's `{1: "a"}` included --
+/// is forwarded output. A false negative is also loud rather than quiet: if
+/// cargo ever stopped putting `reason` first, no message would be read,
+/// `build-finished` among them, and the run would fail as one cargo never
+/// started rather than produce short goldens.
 const MESSAGE_OPENING: &str = r#"{"reason":"#;
 
 /// Sort one invocation's stdout into `build`.
@@ -272,7 +277,10 @@ fn ingest(build: &mut Build, stdout: &str, manifest: &Path) -> io::Result<()> {
         // Cargo forwards anything the compiler or a proc macro writes to stdout
         // into this stream verbatim. A `println!` while debugging a derive is
         // routine, and it is not cargo's JSON: skip it rather than fail the run
-        // over output that has nothing to do with the fixtures.
+        // over output that has nothing to do with the fixtures. That holds for
+        // output that opens with a brace, too: a derive printing a map with
+        // `{:?}` writes `{1: "a"}`, so a line is taken for cargo's only when it
+        // opens the way cargo's messages do.
         //
         // Skipping a whole line is only safe while cargo's own messages stay on
         // lines of their own, and cargo does not document that. Checked against
@@ -286,7 +294,7 @@ fn ingest(build: &mut Build, stdout: &str, manifest: &Path) -> io::Result<()> {
         // looked like a message, and it is skipped as any other line would be.
         // Guessing no further than "this parses as a whole cargo message" is
         // what keeps a proc macro's debug print from failing the run.
-        if !line.starts_with('{') {
+        if !line.starts_with(MESSAGE_OPENING) {
             let recovered = line
                 .find(MESSAGE_OPENING)
                 .and_then(|at| json::parse(&line[at..]).ok());
@@ -800,17 +808,48 @@ mod tests {
     }
 
     /// The check looks for a cargo message, not for a brace, so ordinary output
-    /// that happens to contain JSON-ish text is still skipped quietly.
+    /// that happens to contain JSON-ish text is still skipped quietly -- in the
+    /// middle of a line or at the start of one, and valid JSON or not.
     #[test]
     fn other_text_that_is_not_a_message_is_still_skipped() {
         let mut build = empty();
         ingest(
             &mut build,
-            "look: {\"a\":1} and {\"level\":\"error\"}\n",
+            "look: {\"a\":1} and {\"level\":\"error\"}\n\
+             {\"level\": 3}\n\
+             {\"a\":1} {\"level\":\"error\"}\n\
+             {not json at all\n",
             Path::new(OURS),
         )
         .expect("nothing here is a cargo message");
         assert!(build.messages.is_empty());
+    }
+
+    /// The case that used to fail the whole run: a derive printing a map with
+    /// `{:?}` writes a line that opens with a brace and is not JSON. It is the
+    /// macro's output, not cargo's, and the messages around it are still read.
+    #[test]
+    fn a_debug_printed_map_at_the_start_of_a_line_is_skipped() {
+        let mut build = empty();
+        let stdout = format!(
+            "{{1: \"a\"}}\n{}\n{{}}\n",
+            message(OURS, "f_a", "error", "error: x\n")
+        );
+        ingest(&mut build, &stdout, Path::new(OURS)).expect("not a failure of the run");
+        assert_eq!(build.diagnostics("f_a"), "error: x\n");
+    }
+
+    /// A message forwarded output ran into is still recovered when that output
+    /// opens with a brace, exactly as when it opens with anything else.
+    #[test]
+    fn a_message_behind_brace_led_output_is_still_read() {
+        let mut build = empty();
+        let stdout = format!(
+            "{{1: \"a\"}}{}\n",
+            message(OURS, "f_a", "error", "error: x\n")
+        );
+        ingest(&mut build, &stdout, Path::new(OURS)).expect("the buried message parses");
+        assert_eq!(build.diagnostics("f_a"), "error: x\n");
     }
 
     /// A line that opens like a cargo message but will not parse is a different
