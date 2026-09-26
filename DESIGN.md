@@ -155,6 +155,10 @@ Every fixture in a run is written into the same scratch project, so a run holds 
 
 The same trade applies to the edition: there is no host manifest to read it from, so fixtures compile under edition 2024 unless told otherwise.
 
+## The host's lockfile
+
+The scratch project is a workspace of its own, so left alone cargo would resolve every registry dependency the fixtures reach afresh: under `--offline`, the newest matching version in the local registry cache, not the version the host pins. A golden quoting a dependency's source path (`$CARGO_REGISTRY/some-crate-0.1.6/src/lib.rs`) would then pass on a machine that had never fetched 0.1.7 and fail on one that had, on the same commit, and a fixture could compile against code the host never builds. So each run copies the host workspace's `Cargo.lock` into the scratch project before building. Cargo drops the entries the fixtures do not reach and keeps the pins on the ones they do, so a golden moves exactly when the host's lockfile does. The workspace root comes from `cargo locate-project --workspace` rather than a walk up the directory tree, which would take a stray lockfile in a member that cargo itself ignores. A host with no workspace or no lockfile resolves as before.
+
 ## A controlled build environment
 
 - `RUSTFLAGS` is cleared, including `[build] rustflags` from any `.cargo/config.toml`. An inherited `-D warnings` would turn every fixture's warning into an error and silently change what the goldens contain.

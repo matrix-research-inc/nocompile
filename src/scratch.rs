@@ -61,6 +61,11 @@ impl Layout {
         self.project.join("Cargo.toml")
     }
 
+    /// The scratch project's lockfile, seeded from the host's.
+    pub(crate) fn lockfile(&self) -> PathBuf {
+        self.project.join("Cargo.lock")
+    }
+
     pub(crate) fn bin_path(&self, bin: &str) -> PathBuf {
         self.project.join(bin_relative(bin))
     }

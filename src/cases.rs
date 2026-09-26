@@ -369,7 +369,30 @@ impl TestCases {
         );
         let path = layout.manifest();
         compile::write_if_changed(&path, &manifest)
-            .map_err(|error| io_failure(format!("could not write {}", path.display()), error))
+            .map_err(|error| io_failure(format!("could not write {}", path.display()), error))?;
+
+        // Written every run, over the one cargo pruned last time, so the
+        // fixtures resolve what the host's lockfile pins today. See
+        // `compile::host_lockfile`.
+        let host_lock = compile::host_lockfile(&self.manifest_dir).map_err(|error| {
+            io_failure(
+                "could not ask cargo where the host's workspace is".to_string(),
+                error,
+            )
+        })?;
+        if let Some(host_lock) = host_lock {
+            let contents = fs::read_to_string(&host_lock).map_err(|error| {
+                io_failure(
+                    format!("could not read the host's lockfile {}", host_lock.display()),
+                    error,
+                )
+            })?;
+            let path = layout.lockfile();
+            compile::write_if_changed(&path, &contents).map_err(|error| {
+                io_failure(format!("could not write {}", path.display()), error)
+            })?;
+        }
+        Ok(())
     }
 
     fn check_case(
@@ -641,6 +664,48 @@ mod tests {
         assert!(!t.elide_implementors);
         t.elide_implementors(true);
         assert!(t.elide_implementors);
+    }
+
+    /// A member's scratch project is seeded with its workspace's lockfile, not a
+    /// stray one in the member that cargo ignores; a host with no workspace has
+    /// none to seed.
+    #[test]
+    fn the_scratch_project_takes_the_host_workspace_lockfile() {
+        let dir = std::env::temp_dir().join("nocompile-lockfile-test");
+        let _ = fs::remove_dir_all(&dir);
+        let write = |relative: &str, contents: &str| {
+            let path = dir.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        };
+        write(
+            "workspace/Cargo.toml",
+            "[workspace]\nmembers = [\"member\"]\nresolver = \"3\"\n",
+        );
+        write("workspace/Cargo.lock", "# the workspace's\n");
+        write(
+            "workspace/member/Cargo.toml",
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        write("workspace/member/src/lib.rs", "");
+        write("workspace/member/Cargo.lock", "# a stray one\n");
+        fs::create_dir_all(dir.join("bare")).unwrap();
+
+        let member = TestCases::new(dir.join("workspace/member"), "nocompile-lockfile-member");
+        let layout = Layout::new(&member.manifest_dir, &member.host_pkg_name);
+        let _ = fs::remove_dir_all(&layout.root);
+        member.prepare(&layout).unwrap();
+        assert_eq!(
+            fs::read_to_string(layout.lockfile()).unwrap(),
+            "# the workspace's\n"
+        );
+
+        let bare = TestCases::new(dir.join("bare"), "nocompile-lockfile-bare");
+        let layout = Layout::new(&bare.manifest_dir, &bare.host_pkg_name);
+        let _ = fs::remove_dir_all(&layout.root);
+        bare.prepare(&layout).unwrap();
+        assert!(!layout.lockfile().exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

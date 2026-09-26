@@ -380,6 +380,37 @@ fn cargo() -> std::ffi::OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
 }
 
+/// The lockfile of the workspace the host crate belongs to, if it has one.
+///
+/// The scratch project is a workspace of its own (hazard 2 in `scratch`), so
+/// left alone cargo resolves every registry dependency the fixtures reach
+/// afresh, against whatever `--offline` finds in the local registry cache: the
+/// newest version there that matches. That is not the version the host pins.
+/// A golden that quotes a dependency's source path, as any diagnostic pointing
+/// into one does, then passes or fails according to which versions happen to
+/// be cached, and a fixture can compile against code the host never builds.
+/// Seeding the scratch project with the host's lockfile makes it resolve
+/// exactly what the host does, and move exactly when the host's lockfile does.
+///
+/// Cargo is asked where the workspace root is (`cargo locate-project
+/// --workspace`) rather than the directory tree walked for a `Cargo.lock`: a
+/// member can be nested under another project's directory, and a stray lockfile
+/// in a member is one cargo ignores. `None` when cargo finds no workspace for
+/// the host directory (a host with no manifest of its own) or the workspace has
+/// no lockfile; the scratch project then resolves as it always has.
+pub(crate) fn host_lockfile(manifest_dir: &Path) -> io::Result<Option<PathBuf>> {
+    let output = Command::new(cargo())
+        .args(["locate-project", "--workspace", "--message-format", "plain"])
+        .current_dir(manifest_dir)
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let manifest = String::from_utf8_lossy(&output.stdout);
+    let lock = Path::new(manifest.trim_end()).with_file_name("Cargo.lock");
+    Ok(lock.is_file().then_some(lock))
+}
+
 /// Take the scratch project's lock, blocking until it is free.
 ///
 /// Every fixture in a run is written into the *same* scratch project and built
