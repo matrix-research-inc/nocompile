@@ -505,10 +505,10 @@ fn ends_component(after: Option<char>) -> bool {
 
 /// The placeholder for a dependency, `serde-json` becoming `$SERDE_JSON`.
 ///
-/// Matches `trybuild`'s spelling so its goldens migrate unedited, including its
-/// collision: `a-b` and `a_b` produce the same placeholder. Declaring both is
-/// vanishingly rare and the result is still portable, just ambiguous, which is
-/// not worth diverging from the spelling a migrating golden already contains.
+/// Matches `trybuild`'s spelling, including its collision: `a-b` and `a_b`
+/// produce the same placeholder. Declaring both is vanishingly rare and the
+/// result is still portable, just ambiguous, which is not worth diverging from
+/// the spelling a migrating golden already contains.
 ///
 /// A collision with one of the fixed placeholders is a different matter, since
 /// it makes a dependency indistinguishable from something that is not a
@@ -590,9 +590,8 @@ const SUMMARY: &str = "and $N others";
 ///
 /// rustc indents an entry ten columns past the `= help:` above it, and that
 /// `= help:` sits one column past a gutter at least one wide, so twelve is the
-/// narrowest an entry can be. `trybuild` draws the line in the same place, and
-/// moving it would make a golden blessed by one harness fail under the other --
-/// the outcome this whole rule exists to prevent.
+/// narrowest an entry can be. `trybuild` draws the line in the same place, so
+/// the two harnesses cut a list identically.
 const ENTRY_COLUMN: usize = 12;
 
 /// The entry position that becomes the summary rather than an entry.
@@ -764,8 +763,7 @@ fn elide_implementor_lists(lines: &mut Vec<String>) {
 /// into the golden through the side door, on the rows describing the fixture.
 /// Moving that item to line 1008 would re-bless every row of the golden, which
 /// is the churn the blanking exists to prevent. Shrinking the gutter to what the
-/// surviving numbers need closes it, and is what `trybuild` writes, so a
-/// migrating golden still matches.
+/// surviving numbers need closes it, and is the shape `trybuild` writes.
 ///
 /// The cut is the smallest any row in the block permits, so it is safe by
 /// construction: every row moves by the same amount and none moves further than

@@ -49,7 +49,7 @@ help: provide the argument
   |                ++++++++++
 ```
 
-What it drops is entirely rustc-rendering detail: source snippets, underline art, and the `= note:` lines that a rustc release reflows. What it keeps is every error code, every primary message and every span, so it still catches every regression that matters: a fixture that stops failing, or one that starts failing for a _different_ reason. A message printed over more than one line is kept whole: a `compile_error!` containing a `\n` is split where its author split it, not where a rustc release chose to, so it is part of the assertion. On this crate's own UI suite it takes 33 golden lines down to 7.
+What it drops is entirely rustc-rendering detail: source snippets, underline art, and the `= note:` and `= help:` lines that a rustc release reflows. What it keeps is every error code, every primary message and every `-->` span header, so it still catches every regression that matters: a fixture that stops failing, or one that starts failing for a _different_ reason. A `:::` line is not a header of its own: it locates a secondary label in another file, and is dropped along with the label. A message printed over more than one line is kept whole: a `compile_error!` containing a `\n` is split where its author split it, not where a rustc release chose to, so it is part of the assertion. On this crate's own UI suite it takes 66 golden lines down to 16.
 
 The filter is applied to both sides of the comparison, so an existing `Exact` golden passes in `Brief` mode unchanged.
 
@@ -72,7 +72,7 @@ error[E0080]: evaluation panicked: N must be below 64
 --> tests/ui/too_wide.rs:18:1
 ```
 
-It is `Brief` minus whole lines, and nothing else changes: every code, every primary message and every span in the fixture is still compared. A diagnostic whose only span is elsewhere keeps its message and loses its location. What it gives up is noticing a note that starts or stops pointing at some other file. It also drops the spans into the standard library, including the extra ones rustc prints without `rust-src` ([below](#the-standard-librarys-source)).
+It is `Brief` minus whole lines, and nothing else changes: every code, every primary message and every span header in the fixture is still compared. A diagnostic whose only span is elsewhere keeps its message and loses its location. What it gives up is noticing a note that starts or stops pointing at some other file. It also drops the spans into the standard library, including the extra ones rustc prints without `rust-src` ([below](#the-standard-librarys-source)).
 
 ### Why Exact is the default
 
@@ -120,7 +120,7 @@ fn main() {
 }
 ```
 
-`cargo check` compiles that file without a word. `cargo build` fails it with `error[E0080]: evaluation panicked: N must be a power of two`, the guard's own message, which is exactly what the golden should record. `trybuild` runs `cargo check` unless the suite also contains a `pass` fixture, so a check-only compile-fail suite passes a fixture like this silently, asserting nothing.
+`cargo check` compiles that file without a word. `cargo build` fails it with `error[E0080]: evaluation panicked: N must be a power of two`, the guard's own message, which is exactly what the golden should record. `trybuild` runs `cargo check` unless the suite also contains a `pass` fixture, so in a compile-fail-only suite a guard like this never fires: its fixture is reported as having compiled, and the guard cannot be tested at all until an unrelated `pass` fixture switches the whole suite to `cargo build`. `nocompile` always builds.
 
 `tests/ui/const_guard_fires_at_monomorphization.rs` is that case, kept in this crate's own suite so the choice cannot be undone by accident.
 
@@ -164,6 +164,7 @@ The scratch project is a workspace of its own, so left alone cargo would resolve
 - `RUSTFLAGS` is cleared, including `[build] rustflags` from any `.cargo/config.toml`. An inherited `-D warnings` would turn every fixture's warning into an error and silently change what the goldens contain.
 - Every `CARGO_PROFILE_*` variable is cleared for the same reason one door along: an inherited `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` turns a `#[cfg(debug_assertions)] compile_error!` fixture green, and `CARGO_PROFILE_DEV_OPT_LEVEL` changes which post-monomorphization errors fire at all. A shell variable differs between two people on the same commit; the goldens must not. A `[profile.dev]` in a committed `.cargo/config.toml` is left to apply: it is the same for everyone who checks the repo out, and it is how the crate under test is built anyway.
 - Fixtures are built for exactly the target the suite was built for. A build script records the triple the test binary was compiled for, and the fixture build always passes it as `--target`, as `trybuild` does, so neither `cargo test --target <triple>` nor a `CARGO_BUILD_TARGET` or `[build] target` can leave fixtures on a different target than the suite. A `no_std` crate's compile-fail invariants are usually about its target, and a const guard asserting a 64-bit pointer can only be tested by building for a target that has one.
+- What decides the toolchain is not cleared either: `RUSTUP_TOOLCHAIN`, `RUSTC_BOOTSTRAP` and `CARGO_UNSTABLE_*`. A suite runs on the toolchain you invoke it with ([Scope](README.md#scope)), and clearing them would break a crate under test that needs `RUSTC_BOOTSTRAP` or `-Zbuild-std` to build at all. The flip side is that `RUSTC_BOOTSTRAP=1` lets a stable toolchain accept nightly features, which a fixture asserting a feature gate will notice: that is a choice of toolchain, made by whoever sets it. Wrappers around rustc (`RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`) are left in place too: a wrapper such as `sccache` is transparent by contract, and clearing it would only make every run cold.
 - Fixtures build with `--offline`. A compile-fail suite that can reach the network is a suite that fails in CI for unrelated reasons.
 - A fixture is compiled verbatim, with no injected `fn main`. Detecting a real `fn main` needs a parser, and a wrong guess writes harness-injected source into the golden under the fixture's own name.
 
@@ -171,9 +172,11 @@ The scratch project is a workspace of its own, so left alone cargo would resolve
 
 Normalization is a short, fixed list of substitutions and is meant to stay that way, since every substitution is something a golden can no longer distinguish. The list itself is in the [README](README.md#whats-in-a-golden).
 
+Where a rule overlaps one of `trybuild`'s, it produces the same shape. The lists still differ: `trybuild` also writes `$WORKSPACE`, `$OUT_DIR[...]`, `$VERSION` and `$CARGO`, which this crate does not, so a migrating golden carrying any of them needs a re-bless.
+
 `$RUST` covers all three shapes a toolchain path takes: a rustup toolchain, whose path carries both your home directory *and* the host triple, the older `src/rust/src` layout, and the `/rustc/<commit>/library` form. Any trait bound involving a std type produces one of these, so without it a golden passes only on the machine that blessed it.
 
-The path-dependency rule is one rule rather than a growing list of special cases: a diagnostic is free to point into a dependency's source, and that path is absolute and machine-specific. A dependency that sits *inside* the host crate is already covered by `$DIR` and stays there. Names are uppercased with `-` becoming `_`, matching `trybuild`, so a golden that already contains `$MY_CRATE` migrates unedited.
+The path-dependency rule is one rule rather than a growing list of special cases: a diagnostic is free to point into a dependency's source, and that path is absolute and machine-specific. A dependency that sits *inside* the host crate is already covered by `$DIR` and stays there. Names are uppercased with `-` becoming `_`, the spelling `trybuild` uses.
 
 Every prefix is anchored on a path component boundary, so a sibling checkout at `../my-crate-helper` is not rewritten to `$MY_CRATE-helper`.
 
@@ -193,7 +196,7 @@ note: required by a bound in `take`
 
 Those numbers record where a dependency happens to put its code today. Without this, adding a doc comment near the top of a dependency file re-blesses every golden whose diagnostic reaches into it. `trybuild` does the same thing, for the same reason.
 
-The gutter shrinks with them. rustc sizes it to the widest line number *anywhere* in a diagnostic, children included, so an item at line 508 in a dependency renders the **fixture's own** snippet three columns wide. Blanking the digits alone would leave that width behind, and the dependency's line count would be back in the golden through the side door. So the gutter is re-aligned to the widest number that survived. `trybuild` writes the same shape, so a migrating golden still matches.
+The gutter shrinks with them. rustc sizes it to the widest line number *anywhere* in a diagnostic, children included, so an item at line 508 in a dependency renders the **fixture's own** snippet three columns wide. Blanking the digits alone would leave that width behind, and the dependency's line count would be back in the golden through the side door. So the gutter is re-aligned to the widest number that survived, which is the shape `trybuild` writes.
 
 ### Implementor lists
 
@@ -208,7 +211,7 @@ Where a diagnostic lists the types implementing a trait, rustc prints a count of
 
 The number is a fact about the crate graph, not about the fixture. Adding one `Pod` impl anywhere moves it in every golden whose diagnostic reaches that trait, including all the goldens testing something else entirely.
 
-A list long enough that rustc might elide it is truncated to the shape rustc's own elision produces: the first eight entries and `and $N others`. Where rustc draws that line has moved between releases, and a golden should not record which side of it your current toolchain sits on. `trybuild` normalizes both, so a migrating golden matches.
+A list long enough that rustc might elide it is truncated to the shape rustc's own elision produces: the first eight entries and `and $N others`. Where rustc draws that line has moved between releases, and a golden should not record which side of it your current toolchain sits on. `trybuild` normalizes both the same way.
 
 #### Eliding the list
 

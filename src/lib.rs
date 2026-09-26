@@ -38,9 +38,9 @@
 //!   rendering is the product: a `#[diagnostic::on_unimplemented]` message, a
 //!   `= help:` you wrote, a span you placed on purpose.
 //! - [`Mode::Brief`] compares each error code, primary message and span, and
-//!   drops the snippets, underline art and `= note:` lines a rustc release
-//!   reflows. Use it when goldens are committed and CI builds on more than one
-//!   toolchain, which is most crates.
+//!   drops the snippets, underline art and `= note:` / `= help:` lines a rustc
+//!   release reflows. Use it when goldens are committed and CI builds on more
+//!   than one toolchain, which is most crates.
 //! - [`Mode::BriefLocal`] is `Brief` minus the spans outside the fixture. Use it
 //!   when diagnostics reach into the crate under test, as a const-evaluated
 //!   guard's do, and its internal layout should be free to change.
@@ -85,8 +85,10 @@
 //! manifest. For the core job, `nocompile` is the stronger harness:
 //!
 //! - It catches guards like the one above. `trybuild` runs `cargo check` unless
-//!   the suite also has a `pass` fixture, and then passes such a fixture without
-//!   asserting anything.
+//!   the suite also has a `pass` fixture, so in a compile-fail-only suite such a
+//!   guard never fires: its fixture is reported as having compiled, and the
+//!   guard cannot be tested at all until an unrelated `pass` fixture switches
+//!   the whole suite to `cargo build`.
 //! - [`Mode::Brief`] and [`Mode::BriefLocal`] let goldens survive toolchain
 //!   upgrades. A `trybuild` golden is always the full rendering.
 //! - A path dependency's own warnings stay with the dependency instead of being
@@ -94,7 +96,8 @@
 //! - Fixtures see only the dependencies you declare, not every dev-dependency of
 //!   the host crate.
 //! - `RUSTFLAGS` and every `CARGO_PROFILE_*` variable are cleared for the
-//!   fixture build, so a shell variable cannot change what a golden records.
+//!   fixture build, so an inherited `-D warnings` or profile override cannot
+//!   change what a golden records.
 //! - It depends on nothing but `std`, dev-dependencies included, so it adds
 //!   nothing to your lockfile. Its own compile-fail suite is run by itself.
 //!
@@ -125,7 +128,7 @@
 //!
 //! The reasoning behind these choices is in [DESIGN.md].
 //!
-//! [DESIGN.md]: https://github.com/stephenberry/nocompile/blob/main/DESIGN.md
+//! [DESIGN.md]: https://github.com/matrix-research-inc/nocompile/blob/main/DESIGN.md
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations)]
