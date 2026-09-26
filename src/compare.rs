@@ -38,8 +38,15 @@ pub enum Mode {
     /// lines -- exactly the parts a rustc release reflows. What survives is the
     /// assertion itself, so a fixture that stops failing, or starts failing for a
     /// *different* reason, still fails the test. A message rustc printed over
-    /// more than one line survives whole: those lines are split where their
-    /// author split them, not where a rustc release chose to.
+    /// more than one line survives whole, blank lines included: those lines are
+    /// split where their author split them, not where a rustc release chose to.
+    ///
+    /// The location is each `--> ` span header, with the gutter padding in
+    /// front of it trimmed. A `::: ` line is not one and is dropped: it heads
+    /// the snippet under a secondary label -- the `in this call` beneath a
+    /// related line -- and goes with that label, which is rendering like the
+    /// underline art. Whether rustc attaches one, and so prints the line at
+    /// all, changes between releases.
     ///
     /// Note this is not "error codes only". The primary message is kept in full,
     /// which is the point: `compile_error!` -- how a macro reports misuse, and so
@@ -60,8 +67,8 @@ pub enum Mode {
     /// golden also passes in `Brief` mode. Switching is therefore a one-line
     /// change, and blessing afterwards shrinks the golden to match.
     Brief,
-    /// [`Brief`](Mode::Brief), keeping only the span headers that point into the
-    /// fixture itself.
+    /// [`Brief`](Mode::Brief), keeping only the `--> ` span headers that point
+    /// into the fixture itself.
     ///
     /// A span into any other file -- the crate under test, a dependency, the
     /// standard library -- has already lost its line number to normalization,
@@ -74,12 +81,13 @@ pub enum Mode {
     /// The same argument as [`elide_implementors`](crate::TestCases::elide_implementors),
     /// one step further out.
     ///
-    /// What survives is every code, every primary message, and every span the
-    /// fixture's own author placed. A diagnostic whose only span is elsewhere
-    /// keeps its message and loses its location. So this still catches a
-    /// fixture that stops failing or fails for a different reason; what it no
-    /// longer notices is a note that starts or stops pointing at some other
-    /// file.
+    /// What survives is every code, every primary message, and every `--> `
+    /// span header into the fixture. A `::: ` line is gone already, even one
+    /// into the fixture: `Brief` drops it with the secondary label it locates.
+    /// A diagnostic whose only span header is elsewhere keeps its message and
+    /// loses its location. So this still catches a fixture that stops failing
+    /// or fails for a different reason; what it no longer notices is a note
+    /// that starts or stops pointing at some other file.
     ///
     /// It also takes the standard library out of the comparison. Without the
     /// `rust-src` component rustc splits one annotated block into one span
@@ -161,14 +169,51 @@ pub(crate) fn unify_line_endings(text: &str) -> Cow<'_, str> {
     }
 }
 
+/// Reduce rendered diagnostics to each one's primary message and `--> ` span
+/// headers, dropping everything else.
+///
+/// Idempotent, which is what makes filtering both sides of a comparison safe: a
+/// kept message line keeps its padding and a kept span header loses its, so the
+/// output classifies line for line as it did the first time.
 fn brief(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
     let mut out = String::new();
-    // Whether the last line kept was a primary message, so an indented line
-    // arriving now is the rest of it rather than the top of a snippet.
-    let mut in_message = false;
+    // The width of the level prefix of the primary message kept last, while the
+    // lines arriving may still be the rest of it rather than the top of a
+    // snippet.
+    let mut message: Option<usize> = None;
 
-    for line in text.lines() {
+    for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
+        if let Some(width) = message {
+            // The rest of a message that carries a newline. This is the
+            // author's own text, split where the author split it -- a
+            // `compile_error!` written on more than one line -- so it is part of
+            // the assertion rather than something a rustc release reflows, and
+            // dropping it would let two fixtures whose messages differ only
+            // after the first line compare equal. Tested before the span header
+            // below, because that text is free to begin with `--> ` too.
+            if continues_message(line, width) {
+                out.push_str(line.trim_end());
+                out.push('\n');
+                continue;
+            }
+            // A blank line the author put in the message. rustc pads it like
+            // any other line of the message, but normalization has trimmed that
+            // away, so on its own it is the blank that ends a diagnostic. What
+            // follows it tells them apart: more of the message, or not. Ending
+            // the message here instead would drop every line after the first
+            // paragraph from the comparison.
+            if trimmed.is_empty()
+                && lines[index + 1..]
+                    .iter()
+                    .find(|next| !next.trim_start().is_empty())
+                    .is_some_and(|next| continues_message(next, width))
+            {
+                out.push('\n');
+                continue;
+            }
+        }
         // A span header. The gutter width in front of it tracks the largest line
         // number in the snippet, so it is trimmed: a fixture growing past line 9
         // must not churn its golden.
@@ -176,7 +221,7 @@ fn brief(text: &str) -> String {
             out.push_str("--> ");
             out.push_str(span.trim());
             out.push('\n');
-            in_message = false;
+            message = None;
             continue;
         }
         // A primary message: the level, an optional error code, and the text.
@@ -186,23 +231,48 @@ fn brief(text: &str) -> String {
         {
             out.push_str(line.trim_end());
             out.push('\n');
-            in_message = true;
+            message = level_prefix_width(line);
             continue;
         }
-        // The rest of a message that carries a newline, which rustc indents to
-        // the width of the level prefix. This is the author's own text, split
-        // where the author split it -- a `compile_error!` written on more than
-        // one line -- so it is part of the assertion rather than something a
-        // rustc release reflows, and dropping it would let two fixtures whose
-        // messages differ only after the first line compare equal.
-        if in_message && line.starts_with([' ', '\t']) && !trimmed.is_empty() {
-            out.push_str(line.trim_end());
-            out.push('\n');
-            continue;
-        }
-        in_message = false;
+        message = None;
     }
     out
+}
+
+/// The width of the level prefix a primary message opens with -- `error: `,
+/// `warning: `, `error[E0080]: ` -- which is the padding rustc puts in front of
+/// every later line of that message.
+///
+/// `None` for a line with no prefix to measure, which rustc never prints: it
+/// then opens no message, and nothing after it is read as its continuation.
+fn level_prefix_width(heading: &str) -> Option<usize> {
+    // Neither a level nor an error code contains a colon, so the first one
+    // ends the prefix, and the space rustc prints after it belongs to it.
+    heading.find(':').map(|colon| colon + ": ".len())
+}
+
+/// Whether `line` carries on a message whose level prefix is `width` columns
+/// wide, rather than ending it.
+///
+/// rustc pads every later line of a message to the width of its level prefix,
+/// and the author's own text can only add to that padding. A span header is
+/// padded to the gutter instead, which tracks the digits in a line number and
+/// is far narrower for any real file. So a line padded at least `width` is the
+/// message's own text whatever it begins with -- a `compile_error!` is free to
+/// start a line with `--> ` -- while one padded less is text unless it is the
+/// span header that ends the message.
+///
+/// A blank line is not a continuation by itself: whether it belongs to the
+/// message depends on the line after it, which only the caller can see.
+fn continues_message(line: &str, width: usize) -> bool {
+    let text = line.trim_start();
+    let padding = line.len() - text.len();
+    // Nothing at column 0 continues a message: it is the next heading, or
+    // something that is not a message at all.
+    if padding == 0 || text.is_empty() {
+        return false;
+    }
+    padding >= width || !text.starts_with("--> ")
 }
 
 #[cfg(test)]
@@ -313,6 +383,144 @@ error: MYLIB-E001: expected a struct with named fields
     #[test]
     fn brief_drops_indented_error_text_inside_a_snippet() {
         assert_eq!(filter("   error: not a header\n", Mode::Brief, FIXTURE), "");
+    }
+
+    /// A `compile_error!("...\n\n...")`, normalized: rustc pads the blank line
+    /// like the rest of the message, and normalization trims the padding away.
+    const BLANK_IN_MESSAGE: &str = "\
+error: MYLIB-E003: expected a struct with named fields
+
+       help: derive on a struct, not an enum
+ --> tests/ui/a.rs:1:1
+  |
+1 | compile_error!(\"MYLIB-E003: expected a struct with named fields\\n\\nhelp: derive on a struct, not an enum\");
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+";
+
+    #[test]
+    fn brief_keeps_a_message_past_a_blank_line_in_it() {
+        assert_eq!(
+            filter(BLANK_IN_MESSAGE, Mode::Brief, FIXTURE),
+            concat!(
+                "error: MYLIB-E003: expected a struct with named fields\n",
+                "\n",
+                "       help: derive on a struct, not an enum\n",
+                "--> tests/ui/a.rs:1:1\n",
+            )
+        );
+    }
+
+    /// A golden that kept rustc's padding on the blank line -- written by hand,
+    /// say -- reads the same as one normalization trimmed.
+    #[test]
+    fn brief_reads_a_padded_blank_line_in_a_message_as_a_blank_one() {
+        let padded = BLANK_IN_MESSAGE.replacen("\n\n", "\n       \n", 1);
+        assert_eq!(
+            filter(&padded, Mode::Brief, FIXTURE),
+            filter(BLANK_IN_MESSAGE, Mode::Brief, FIXTURE)
+        );
+    }
+
+    /// The failure a blank line used to cause: everything after the first
+    /// paragraph fell out of the comparison, so a changed tail still passed.
+    #[test]
+    fn brief_sees_a_change_after_a_blank_line_in_a_message() {
+        let changed = BLANK_IN_MESSAGE.replace("not an enum", "not a union");
+        for mode in [Mode::Brief, Mode::BriefLocal] {
+            assert_ne!(
+                filter(BLANK_IN_MESSAGE, mode, FIXTURE),
+                filter(&changed, mode, FIXTURE),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn brief_on_a_message_with_a_blank_line_is_idempotent() {
+        for mode in [Mode::Brief, Mode::BriefLocal] {
+            let once = filter(BLANK_IN_MESSAGE, mode, FIXTURE);
+            assert_eq!(filter(&once, mode, FIXTURE), once, "{mode}");
+        }
+    }
+
+    /// Only a blank line with more of the message after it is kept. The one
+    /// rustc ends a diagnostic with is followed by the next heading, or by
+    /// nothing, and goes as before.
+    #[test]
+    fn brief_drops_the_blank_line_that_ends_a_diagnostic() {
+        assert_eq!(
+            filter("error: a\n\nerror: b\n\n", Mode::Brief, FIXTURE),
+            "error: a\nerror: b\n"
+        );
+    }
+
+    /// A message whose second line begins with an arrow, as rustc renders
+    /// `compile_error!("head\n--> not a span")`: padded to the width of
+    /// `error: `, as every line after a message's first is, and wider than the
+    /// gutter a real span header is padded to.
+    const ARROW_IN_MESSAGE: &str = "\
+error: head
+       --> not a span
+ --> tests/ui/a.rs:1:1
+  |
+1 | compile_error!(\"head\\n--> not a span\");
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+";
+
+    #[test]
+    fn brief_reads_a_message_line_beginning_with_an_arrow_as_text() {
+        assert_eq!(
+            filter(ARROW_IN_MESSAGE, Mode::Brief, FIXTURE),
+            concat!(
+                "error: head\n",
+                "       --> not a span\n",
+                "--> tests/ui/a.rs:1:1\n",
+            )
+        );
+    }
+
+    /// `BriefLocal` drops span headers pointing outside the fixture, and
+    /// `not a span` is not the fixture. Read as a span header, the line would
+    /// vanish and a change to it would go unseen.
+    #[test]
+    fn brief_local_keeps_a_message_line_beginning_with_an_arrow() {
+        let local = |text: &str| filter(text, Mode::BriefLocal, FIXTURE);
+        assert_eq!(
+            local(ARROW_IN_MESSAGE),
+            filter(ARROW_IN_MESSAGE, Mode::Brief, FIXTURE)
+        );
+        assert_ne!(
+            local(ARROW_IN_MESSAGE),
+            local(&ARROW_IN_MESSAGE.replace("not a span", "something else"))
+        );
+    }
+
+    #[test]
+    fn brief_on_a_message_line_beginning_with_an_arrow_is_idempotent() {
+        for mode in [Mode::Brief, Mode::BriefLocal] {
+            let once = filter(ARROW_IN_MESSAGE, mode, FIXTURE);
+            assert_eq!(filter(&once, mode, FIXTURE), once, "{mode}");
+        }
+    }
+
+    /// The padding a message line needs is its own heading's prefix, so a
+    /// longer prefix moves the line between text and span header.
+    #[test]
+    fn brief_measures_the_padding_against_the_headings_own_prefix() {
+        // Padded past `error: ` but short of `error[E0080]: `: the span header.
+        assert_eq!(
+            filter(
+                "error[E0080]: x\n         --> tests/ui/a.rs:1:1\n",
+                Mode::Brief,
+                FIXTURE
+            ),
+            "error[E0080]: x\n--> tests/ui/a.rs:1:1\n"
+        );
+        // Padded to `warning: `: text.
+        assert_eq!(
+            filter("warning: x\n         --> y\n", Mode::Brief, FIXTURE),
+            "warning: x\n         --> y\n"
+        );
     }
 
     /// A panic in a generic `const`, as rustc renders it once something
