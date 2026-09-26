@@ -107,8 +107,13 @@ pub enum Failure {
         /// The comparison mode in force.
         mode: Mode,
     },
-    /// A fixture directory that matched no `.rs` files. Reported rather than
-    /// passed silently: an empty directory means the suite is not running.
+    /// A registered fixture directory with no `.rs` file directly in it.
+    /// Reported rather than passed silently: a directory that contributes no
+    /// fixture means that part of the suite is not running.
+    ///
+    /// The directory need not be empty. Registration is not recursive, so one
+    /// whose fixtures all sit in subdirectories contributes none of them, and
+    /// those are reported by [`Failure::UnregisteredFixtures`] besides.
     NoFixtures {
         /// The directory that matched nothing.
         directory: PathBuf,
@@ -116,6 +121,92 @@ pub enum Failure {
     /// No fixtures were registered at all. The same hazard as [`Failure::NoFixtures`]:
     /// a suite that asserts nothing must not report success.
     NothingRegistered,
+    /// `.rs` files under a registered directory that no registration covers.
+    ///
+    /// Directory registration takes the `.rs` files directly in a directory and
+    /// nothing below it, so a fixture filed into a subdirectory would otherwise
+    /// go untested without a word -- and the suite would still pass, since the
+    /// fixtures that did register still report a count. One failure per
+    /// registered directory, found when the suite runs rather than when it
+    /// registers, because the registration that would cover a subdirectory may
+    /// come later.
+    UnregisteredFixtures {
+        /// The registered directory the files were found under.
+        directory: PathBuf,
+        /// The files no registration covers, in path order.
+        fixtures: Vec<PathBuf>,
+    },
+    /// A `.stderr` file in a registered directory that is not the golden of any
+    /// registered `compile_fail` fixture, so nothing compares against it.
+    ///
+    /// Usually the golden of a fixture that was renamed or deleted, which would
+    /// otherwise sit in the tree looking like an assertion while it drifts. A
+    /// blessing run reports it too: the harness never deletes a golden, since it
+    /// cannot know the file is not someone's work.
+    OrphanGolden {
+        /// The golden no registered fixture claims.
+        golden: PathBuf,
+    },
+    /// One fixture registered both as `compile_fail` and as `pass`.
+    ///
+    /// Registering it twice under one kind is harmless and ignored, but these
+    /// two assertions contradict each other and the scratch project can hold
+    /// the fixture only once. The first registration is the one the run
+    /// checks; the run fails on this regardless.
+    ConflictingRegistration {
+        /// The fixture registered twice.
+        fixture: PathBuf,
+        /// The kind it was registered as first.
+        registered: Kind,
+        /// The kind a later registration asked for.
+        conflicting: Kind,
+    },
+    /// A fixture path, relative to the host manifest directory, that is not
+    /// valid UTF-8. The fixture is not registered.
+    ///
+    /// That path is written into the fixture's golden and names its target in
+    /// the generated manifest, and both are text. Converting it lossily is what
+    /// the harness used to do, which let two such names collapse into one.
+    NonUtf8Fixture {
+        /// The fixture's path, exactly as registered. Displayed lossily.
+        fixture: PathBuf,
+    },
+    /// A `raw_manifest_lines` entry whose first line that is not blank or a
+    /// comment is not a table header.
+    ///
+    /// Raw lines are appended after the generated `[[bin]]` tables, so a bare
+    /// key there would silently become metadata of the last fixture's bin.
+    /// Nothing is built while this stands.
+    RawManifestLinesWithoutHeader {
+        /// The offending line.
+        line: String,
+    },
+    /// `dependency_path` was given an empty name. Nothing is built while this
+    /// stands.
+    EmptyDependencyName {
+        /// The dependency's resolved path, to say which call it was.
+        path: PathBuf,
+    },
+    /// `dependency_path` was given a name whose normalization placeholder is
+    /// one the harness reserves for something else -- `rust` would become
+    /// `$RUST`, the toolchain's source. Nothing is built while this stands.
+    ///
+    /// Refused by name, whether or not the dependency would actually receive a
+    /// placeholder, so the rule does not depend on where it lives.
+    ReservedDependencyName {
+        /// The name as given.
+        name: String,
+        /// The reserved placeholder it would have produced.
+        placeholder: String,
+    },
+    /// A dependency path that is not valid UTF-8, which a Cargo manifest cannot
+    /// name. Nothing is built while this stands.
+    NonUtf8Dependency {
+        /// The dependency's name as given.
+        name: String,
+        /// Its resolved path, exactly. Displayed lossily.
+        path: PathBuf,
+    },
     /// Cargo itself failed -- a manifest it could not parse, a dependency it
     /// could not resolve. Not a property of the fixture.
     Cargo {
@@ -140,6 +231,42 @@ pub enum Failure {
         /// be cloned and reported by more than one run.
         message: String,
     },
+}
+
+impl Failure {
+    /// Whether this failure refused part of the scratch project's manifest, so
+    /// that nothing may be built while it stands.
+    ///
+    /// Building the manifest without the refused part would compile the
+    /// fixtures against a configuration nobody asked for: a dependency missing,
+    /// a table dropped. Every diagnostic would then be about that, and a
+    /// blessing run would write it into the goldens. A refused *fixture* is
+    /// different -- it is left out, and the rest of the suite is as valid
+    /// without it as it was with it.
+    ///
+    /// The match is exhaustive on purpose, so a new variant has to answer.
+    pub(crate) fn refuses_the_manifest(&self) -> bool {
+        match self {
+            Failure::RawManifestLinesWithoutHeader { .. }
+            | Failure::EmptyDependencyName { .. }
+            | Failure::ReservedDependencyName { .. }
+            | Failure::NonUtf8Dependency { .. } => true,
+            Failure::Compiled
+            | Failure::DidNotCompile { .. }
+            | Failure::NoDiagnostics { .. }
+            | Failure::MissingGolden { .. }
+            | Failure::Mismatch { .. }
+            | Failure::NoFixtures { .. }
+            | Failure::NothingRegistered
+            | Failure::UnregisteredFixtures { .. }
+            | Failure::OrphanGolden { .. }
+            | Failure::ConflictingRegistration { .. }
+            | Failure::NonUtf8Fixture { .. }
+            | Failure::Cargo { .. }
+            | Failure::ManifestMismatch { .. }
+            | Failure::Io { .. } => false,
+        }
+    }
 }
 
 impl Display for Failure {
@@ -211,13 +338,97 @@ impl Display for Failure {
                 }
                 write!(f, "\nrun with NOCOMPILE=overwrite to update the golden")
             }
+            // Worded to be true of an empty directory and of one whose fixtures
+            // are all nested, which this failure cannot tell apart.
             Failure::NoFixtures { directory } => write!(
                 f,
-                "no .rs fixtures in {} -- the suite would pass without testing anything",
+                "no .rs fixtures directly in {} -- registering it tests nothing. Registration \
+                 is not recursive: a fixture in a subdirectory is registered only by \
+                 registering that subdirectory.",
                 directory.display()
             ),
             Failure::NothingRegistered => f.write_str(
                 "no fixtures were registered -- the suite would pass without testing anything",
+            ),
+            Failure::UnregisteredFixtures {
+                directory,
+                fixtures,
+            } => {
+                let directory = directory.display();
+                writeln!(
+                    f,
+                    "{} .rs file(s) under {directory} are not registered, so they are not tested:\n",
+                    fixtures.len()
+                )?;
+                for fixture in fixtures {
+                    writeln!(f, "    {}", fixture.display())?;
+                }
+                write!(
+                    f,
+                    "\nRegistering a directory is not recursive: it takes the .rs files directly \
+                     in {directory} and nothing below it. Register the subdirectory that holds \
+                     them, or move a file that is not a fixture out from under {directory}."
+                )
+            }
+            Failure::OrphanGolden { golden } => write!(
+                f,
+                "{} is not the golden of any registered compile_fail fixture, so nothing \
+                 compares against it. Its fixture was likely renamed or deleted, or is \
+                 registered as a pass fixture, which has no golden. Rename the golden to follow \
+                 its fixture, or delete it; NOCOMPILE=overwrite never deletes a golden.",
+                golden.display()
+            ),
+            Failure::ConflictingRegistration {
+                fixture,
+                registered,
+                conflicting,
+            } => write!(
+                f,
+                "{} is registered as both {} and {}, and a fixture can only be one. This run \
+                 checks it as {}; remove the other registration, or move the fixture into a \
+                 directory registered for the kind it is.",
+                fixture.display(),
+                registered.label(),
+                conflicting.label(),
+                registered.label()
+            ),
+            Failure::NonUtf8Fixture { fixture } => write!(
+                f,
+                "the fixture path {} is not valid UTF-8, so it was not registered. A fixture's \
+                 path is written into its golden and into the generated Cargo manifest, both of \
+                 which are text, and cannot be carried there faithfully. Rename the fixture.",
+                fixture.display()
+            ),
+            Failure::RawManifestLinesWithoutHeader { line } => write!(
+                f,
+                "raw_manifest_lines was given text that does not begin with a table header:\n\n\
+                 \x20   {line}\n\n\
+                 The text is appended after the generated [[bin]] tables, so a bare key there \
+                 would silently become metadata of the last fixture's bin target. Begin it with \
+                 the header of the table it belongs in, such as [features]. Nothing was built."
+            ),
+            Failure::EmptyDependencyName { path } => write!(
+                f,
+                "dependency_path was given an empty name for the dependency at {}. The name must \
+                 be the dependency's package name, exactly as its Cargo.toml spells it. Nothing \
+                 was built.",
+                path.display()
+            ),
+            Failure::ReservedDependencyName { name, placeholder } => write!(
+                f,
+                "dependency_path was given the name `{name}`, whose normalization placeholder \
+                 {placeholder} is reserved for something else: a path into the dependency would \
+                 read in every golden as that, not as the dependency. A crate with this package \
+                 name can still be declared through raw_manifest_lines, as a \
+                 [dependencies.{name}] table, at the cost of having no placeholder. Nothing was \
+                 built."
+            ),
+            Failure::NonUtf8Dependency { name, path } => write!(
+                f,
+                "the path of dependency `{name}`, {}, is not valid UTF-8. A Cargo manifest is \
+                 UTF-8 and cannot name it, so cargo could not find the dependency. Move it to a \
+                 path that is valid UTF-8. Nothing was built.",
+                path.display()
             ),
             Failure::Cargo { message } => {
                 write!(f, "cargo could not run the fixture build:\n\n{message}")

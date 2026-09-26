@@ -1,12 +1,13 @@
 //! The public API: register fixtures, run them, report.
 
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::compare::{self, Mode};
 use crate::compile;
-use crate::normalize::Normalizer;
+use crate::normalize::{self, Normalizer};
 use crate::outcome::{CaseOutcome, Failure, Kind, Outcome};
 use crate::path::lexical_join;
 use crate::scratch::{self, Dependency, Layout};
@@ -61,6 +62,13 @@ pub struct TestCases {
     dependencies: Vec<Dependency>,
     raw_manifest_lines: Vec<String>,
     cases: Vec<Case>,
+    /// Every directory registered and read, absolute, once each. Kept so `run`
+    /// can check what lies under them against what was registered.
+    directories: Vec<PathBuf>,
+    /// Fixtures refused at registration, absolute. Each already has a failure
+    /// of its own in `setup`, so the directory check must not report it again
+    /// as unregistered.
+    refused_fixtures: Vec<PathBuf>,
     /// Problems found while registering fixtures, reported by every `run`.
     setup: Vec<Failure>,
 }
@@ -81,14 +89,20 @@ impl TestCases {
             dependencies: Vec::new(),
             raw_manifest_lines: Vec::new(),
             cases: Vec::new(),
+            directories: Vec::new(),
+            refused_fixtures: Vec::new(),
             setup: Vec::new(),
         }
     }
 
     /// Make a crate available to every fixture, by path.
     ///
-    /// `path` is resolved against the host crate's manifest directory. In the
-    /// common case this is one line naming the crate under test.
+    /// `name` is the dependency's package name, verbatim: the `name` in its
+    /// `Cargo.toml`. Cargo does not treat `-` and `_` as interchangeable here,
+    /// so `my_crate` does not find a package named `my-crate`, even though the
+    /// fixtures refer to it as `my_crate`. `path` is resolved against the host
+    /// crate's manifest directory. In the common case this is one line naming
+    /// the crate under test.
     ///
     /// Dependencies are declared rather than inferred from the host manifest.
     /// That removes the harness's two heaviest steps, and it is also tighter:
@@ -99,16 +113,28 @@ impl TestCases {
     /// A dependency outside the host crate also gets a normalization
     /// placeholder, `my-crate` becoming `$MY_CRATE`, so a diagnostic that points
     /// into its source does not put an absolute path in a golden.
+    ///
+    /// Some declarations are refused, each as a setup failure that stops the
+    /// run before anything is built: an empty `name`; a `name` whose
+    /// placeholder is one normalization already uses for something else
+    /// (`dir`, `scratch`, `cargo-registry`, `cargo-home`, `rust`, `crate`, `n`,
+    /// `implementors`), refused whether or not this dependency would actually
+    /// receive a placeholder, so the rule does not depend on where it lives;
+    /// and a `path` that is not valid UTF-8, which a Cargo manifest cannot
+    /// name.
     pub fn dependency_path(
         &mut self,
         name: impl Into<String>,
         path: impl AsRef<Path>,
     ) -> &mut Self {
+        let name = name.into();
         let path = lexical_join(&self.manifest_dir, path.as_ref());
-        self.dependencies.push(Dependency {
-            name: name.into(),
-            path,
-        });
+        let refusals = dependency_refusals(&name, &path);
+        if refusals.is_empty() {
+            self.dependencies.push(Dependency { name, path });
+        } else {
+            self.setup.extend(refusals);
+        }
         self
     }
 
@@ -120,8 +146,24 @@ impl TestCases {
     /// in the local cargo cache, and that `debug` and `incremental` are set for
     /// the fixture build through the environment, which outranks a manifest
     /// profile: a `[profile.dev]` added here cannot turn either back on.
+    ///
+    /// The text is appended after the generated `[[bin]]` tables, one per
+    /// fixture, so it must open with a table header of its own: its first line
+    /// that is not blank or a `#` comment has to begin with `[`. A bare
+    /// `key = value` there would otherwise belong to the last fixture's bin
+    /// target, where cargo accepts it without effect or complaint. Text that
+    /// does not is refused, as a setup failure that stops the run before
+    /// anything is built.
     pub fn raw_manifest_lines(&mut self, lines: impl Into<String>) -> &mut Self {
-        self.raw_manifest_lines.push(lines.into());
+        let lines = lines.into();
+        match first_significant_line(&lines) {
+            Some(line) if !line.starts_with('[') => {
+                self.setup.push(Failure::RawManifestLinesWithoutHeader {
+                    line: line.to_string(),
+                });
+            }
+            _ => self.raw_manifest_lines.push(lines),
+        }
         self
     }
 
@@ -197,6 +239,14 @@ impl TestCases {
 
     /// Register every `.rs` file directly in `dir` as a compile-fail fixture,
     /// ordered by file name so the report is stable.
+    ///
+    /// Registration is not recursive, and it is checked rather than trusted:
+    /// when the suite runs, every `.rs` file anywhere under `dir` must be
+    /// covered by some registration -- this one, one of the subdirectory
+    /// holding it, or one of the file itself -- and every `.stderr` file must
+    /// be the golden of a registered `compile_fail` fixture. Anything else
+    /// fails the run, named. A fixture in a subdirectory is registered by
+    /// registering that subdirectory, before or after this call.
     pub fn compile_fail_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
         self.push_dir(dir.as_ref(), Kind::CompileFail);
         self
@@ -210,6 +260,11 @@ impl TestCases {
     }
 
     /// Register every `.rs` file directly in `dir` as a pass fixture.
+    ///
+    /// Not recursive, and checked the same way as
+    /// [`compile_fail_dir`](TestCases::compile_fail_dir): a `.rs` file under
+    /// `dir` that no registration covers fails the run, and so does a `.stderr`
+    /// file, since a pass fixture has no golden.
     pub fn pass_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
         self.push_dir(dir.as_ref(), Kind::Pass);
         self
@@ -222,6 +277,7 @@ impl TestCases {
     /// the five cases in such a suite assert that the harness *fails*.
     pub fn run(&self) -> Outcome {
         let mut setup = self.setup.clone();
+        setup.extend(self.unaccounted_files());
 
         // A suite that asserts nothing must not report success. This is the same
         // hazard `NoFixtures` covers, one level up: registration forgotten, or
@@ -230,6 +286,13 @@ impl TestCases {
             if setup.is_empty() {
                 setup.push(Failure::NothingRegistered);
             }
+            return Outcome::new(setup, Vec::new());
+        }
+
+        // Building without the refused part of the manifest would check every
+        // fixture against a configuration nobody asked for, and a blessing run
+        // would write what that produced into the goldens.
+        if setup.iter().any(Failure::refuses_the_manifest) {
             return Outcome::new(setup, Vec::new());
         }
 
@@ -513,13 +576,46 @@ impl TestCases {
 
     fn push_file(&mut self, path: &Path, kind: Kind) {
         let absolute = lexical_join(&self.manifest_dir, path);
-        let relative = relative_to(&self.manifest_dir, &absolute);
-        self.push_case(relative, absolute, kind);
+        self.push_case(absolute, kind);
     }
 
     /// The one place a `Case` is built, so its bin name is never left to a
-    /// caller to keep in step with its path.
-    fn push_case(&mut self, relative: String, absolute: PathBuf, kind: Kind) {
+    /// caller to keep in step with its path, and every registration is
+    /// validated the same way however it arrived.
+    fn push_case(&mut self, absolute: PathBuf, kind: Kind) {
+        // The relative path is the fixture's identity in its golden and the
+        // input to its bin name, so it has to survive as text exactly. A lossy
+        // conversion would let two names differing only in invalid bytes become
+        // one bin, which cargo rejects for the whole run.
+        let from_manifest_dir = absolute
+            .strip_prefix(&self.manifest_dir)
+            .unwrap_or(&absolute);
+        if from_manifest_dir.to_str().is_none() {
+            self.setup.push(Failure::NonUtf8Fixture {
+                fixture: from_manifest_dir.to_path_buf(),
+            });
+            self.refused_fixtures.push(absolute);
+            return;
+        }
+        let relative = relative_to(&self.manifest_dir, &absolute);
+
+        // The bin name is a pure function of the relative path, so a second
+        // registration of one fixture -- a directory and a file inside it, one
+        // directory twice, `a.rs` and `./a.rs` -- would be a second `[[bin]]`
+        // of the same name, and cargo would reject the manifest for the whole
+        // run. Under one kind it asks for nothing new; under two it asks for
+        // a contradiction no manifest can express.
+        if let Some(existing) = self.cases.iter().find(|case| case.relative == relative) {
+            if existing.kind != kind {
+                self.setup.push(Failure::ConflictingRegistration {
+                    fixture: PathBuf::from(&relative),
+                    registered: existing.kind,
+                    conflicting: kind,
+                });
+            }
+            return;
+        }
+
         let bin = scratch::bin_name(&relative);
         self.cases.push(Case {
             relative,
@@ -560,12 +656,24 @@ impl TestCases {
             }
         }
 
+        // Recorded only once it has been read in full: a directory that could
+        // not be has its failure already, and checking it again at run time
+        // would only repeat it.
+        let first_registration = !self.directories.contains(&absolute);
+        if first_registration {
+            self.directories.push(absolute.clone());
+        }
+
         // A directory that matches nothing means the suite is not running, which
-        // is worth saying out loud rather than reporting as a clean pass.
+        // is worth saying out loud rather than reporting as a clean pass. Once
+        // per directory: registering it again, under the other kind, does not
+        // make it any emptier.
         if files.is_empty() {
-            self.setup.push(Failure::NoFixtures {
-                directory: PathBuf::from(relative_to(&self.manifest_dir, &absolute)),
-            });
+            if first_registration {
+                self.setup.push(Failure::NoFixtures {
+                    directory: PathBuf::from(relative_to(&self.manifest_dir, &absolute)),
+                });
+            }
             return;
         }
 
@@ -573,10 +681,165 @@ impl TestCases {
         // filesystem.
         files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
         for file in files {
-            let relative = relative_to(&self.manifest_dir, &file);
-            self.push_case(relative, file, kind);
+            self.push_case(file, kind);
         }
     }
+
+    /// Check every registered directory for files its registrations leave
+    /// unaccounted for: `.rs` files no registration covers, and `.stderr` files
+    /// no registered `compile_fail` fixture claims as its golden.
+    ///
+    /// Done when the suite runs rather than when a directory is registered,
+    /// because the order of registrations is the caller's:
+    /// `compile_fail_dir("tests/ui")` may well come before the
+    /// `pass_dir("tests/ui/pass")` that covers its subdirectory.
+    fn unaccounted_files(&self) -> Vec<Failure> {
+        let registered: HashSet<&Path> = self
+            .cases
+            .iter()
+            .map(|case| case.absolute.as_path())
+            .collect();
+        let refused: HashSet<&Path> = self.refused_fixtures.iter().map(PathBuf::as_path).collect();
+        let claimed_goldens: HashSet<PathBuf> = self
+            .cases
+            .iter()
+            .filter(|case| case.kind == Kind::CompileFail)
+            .map(|case| golden_path(&case.absolute))
+            .collect();
+        let relative = |path: &Path| PathBuf::from(relative_to(&self.manifest_dir, path));
+
+        let mut failures = Vec::new();
+        for directory in &self.directories {
+            let mut unregistered: Vec<PathBuf> = Vec::new();
+            let mut orphans: Vec<PathBuf> = Vec::new();
+            let mut pending = vec![directory.clone()];
+            while let Some(current) = pending.pop() {
+                let entries = match fs::read_dir(&current) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        failures.push(io_failure(
+                            format!(
+                                "could not read {} to check {} for unregistered fixtures",
+                                relative(&current).display(),
+                                relative(directory).display()
+                            ),
+                            error,
+                        ));
+                        continue;
+                    }
+                };
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        // The rest of this directory goes unchecked, which is
+                        // what the failure says; the others are still checked.
+                        Err(error) => {
+                            failures.push(io_failure(
+                                format!(
+                                    "could not read an entry of {} to check {} for unregistered \
+                                     fixtures",
+                                    relative(&current).display(),
+                                    relative(directory).display()
+                                ),
+                                error,
+                            ));
+                            break;
+                        }
+                    };
+                    let path = entry.path();
+                    let file_type = match entry.file_type() {
+                        Ok(file_type) => file_type,
+                        Err(error) => {
+                            failures.push(io_failure(
+                                format!("could not tell what {} is", relative(&path).display()),
+                                error,
+                            ));
+                            continue;
+                        }
+                    };
+                    // `file_type` does not follow a symlink, so a symlinked
+                    // directory is not descended into: following one can cycle.
+                    // A directory registered in its own right is checked on its
+                    // own turn, so each file is reported once, against the
+                    // registration nearest it.
+                    if file_type.is_dir() {
+                        if !self.directories.contains(&path) {
+                            pending.push(path);
+                        }
+                        continue;
+                    }
+                    // Following a symlink here, as registration does.
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let extension = path.extension();
+                    if extension.is_some_and(|extension| extension == "rs") {
+                        if !registered.contains(path.as_path()) && !refused.contains(path.as_path())
+                        {
+                            unregistered.push(path);
+                        }
+                    } else if extension.is_some_and(|extension| extension == "stderr")
+                        && !claimed_goldens.contains(&path)
+                    {
+                        orphans.push(path);
+                    }
+                }
+            }
+
+            // A golden beside a fixture that is itself unregistered or refused is
+            // covered by that fixture's own failure: registering it claims the
+            // golden, so reporting both would be one problem counted twice.
+            let reported: HashSet<PathBuf> = unregistered.iter().cloned().collect();
+            orphans.retain(|golden| {
+                let fixture = golden.with_extension("rs");
+                !reported.contains(&fixture) && !refused.contains(fixture.as_path())
+            });
+
+            unregistered.sort();
+            orphans.sort();
+            if !unregistered.is_empty() {
+                failures.push(Failure::UnregisteredFixtures {
+                    directory: relative(directory),
+                    fixtures: unregistered.iter().map(|path| relative(path)).collect(),
+                });
+            }
+            failures.extend(orphans.iter().map(|golden| Failure::OrphanGolden {
+                golden: relative(golden),
+            }));
+        }
+        failures
+    }
+}
+
+/// Every reason to refuse a dependency declaration, empty if there is none.
+fn dependency_refusals(name: &str, path: &Path) -> Vec<Failure> {
+    let mut refusals = Vec::new();
+    if name.is_empty() {
+        refusals.push(Failure::EmptyDependencyName {
+            path: path.to_path_buf(),
+        });
+    }
+    let placeholder = normalize::placeholder(name);
+    if normalize::RESERVED.contains(&placeholder.as_str()) {
+        refusals.push(Failure::ReservedDependencyName {
+            name: name.to_string(),
+            placeholder,
+        });
+    }
+    if path.to_str().is_none() {
+        refusals.push(Failure::NonUtf8Dependency {
+            name: name.to_string(),
+            path: path.to_path_buf(),
+        });
+    }
+    refusals
+}
+
+/// The first line of `text` that is neither blank nor a `#` comment, trimmed.
+fn first_significant_line(text: &str) -> Option<&str> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
 }
 
 /// Build a [`Failure::Io`]. The `io::Error` is rendered rather than kept so a
@@ -654,6 +917,177 @@ mod tests {
             "{}",
             outcome.report()
         );
+    }
+
+    /// Every spelling of one registration is one case, since each would be a
+    /// `[[bin]]` of the same name and cargo rejects the manifest for that.
+    #[test]
+    fn a_fixture_registered_twice_under_one_kind_is_one_case() {
+        let mut t = TestCases::new("/w", "host");
+        t.compile_fail("ui/a.rs");
+        t.compile_fail("./ui/a.rs");
+        t.compile_fail("ui/../ui/a.rs");
+        t.compile_fail("/w/ui/a.rs");
+        assert_eq!(t.cases.len(), 1);
+        assert!(t.setup.is_empty(), "{:?}", t.setup);
+    }
+
+    #[test]
+    fn a_fixture_registered_under_both_kinds_is_refused_by_name() {
+        let mut t = TestCases::new("/w", "host");
+        t.pass("ui/a.rs");
+        t.compile_fail("ui/a.rs");
+        assert_eq!(t.cases.len(), 1);
+        assert_eq!(t.cases[0].kind, Kind::Pass, "the first registration stands");
+        let [
+            Failure::ConflictingRegistration {
+                fixture,
+                registered: Kind::Pass,
+                conflicting: Kind::CompileFail,
+            },
+        ] = t.setup.as_slice()
+        else {
+            panic!("{:?}", t.setup);
+        };
+        assert_eq!(fixture, Path::new("ui/a.rs"));
+        let message = t.setup[0].to_string();
+        assert!(
+            message.contains("ui/a.rs is registered as both pass and compile_fail"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn raw_manifest_lines_must_open_with_a_table_header() {
+        let mut t = TestCases::new("/w", "host");
+        t.raw_manifest_lines("[features]\nfoo = []");
+        t.raw_manifest_lines("\n# a comment first\n  [[example]]\nname = \"e\"");
+        t.raw_manifest_lines("# nothing but a comment\n\n");
+        assert!(t.setup.is_empty(), "{:?}", t.setup);
+        assert_eq!(t.raw_manifest_lines.len(), 3);
+
+        t.raw_manifest_lines("# a comment first\nfoo = \"bar\"\n[features]");
+        assert_eq!(
+            t.raw_manifest_lines.len(),
+            3,
+            "the refused text is not kept"
+        );
+        let [Failure::RawManifestLinesWithoutHeader { line }] = t.setup.as_slice() else {
+            panic!("{:?}", t.setup);
+        };
+        assert_eq!(line, "foo = \"bar\"");
+    }
+
+    #[test]
+    fn an_empty_dependency_name_is_refused() {
+        let mut t = TestCases::new("/w", "host");
+        t.dependency_path("", "helper");
+        assert!(t.dependencies.is_empty());
+        let [Failure::EmptyDependencyName { path }] = t.setup.as_slice() else {
+            panic!("{:?}", t.setup);
+        };
+        assert_eq!(path, Path::new("/w/helper"));
+    }
+
+    /// Refused by name, including a dependency inside the host crate that would
+    /// never have received a placeholder, and including the `-` spelling.
+    #[test]
+    fn a_dependency_named_like_a_reserved_placeholder_is_refused() {
+        for (name, reserved) in [
+            ("dir", "$DIR"),
+            ("rust", "$RUST"),
+            ("cargo-home", "$CARGO_HOME"),
+            ("cargo_registry", "$CARGO_REGISTRY"),
+            ("n", "$N"),
+            ("Crate", "$CRATE"),
+        ] {
+            let mut t = TestCases::new("/w", "host");
+            t.dependency_path(name, "inside");
+            assert!(t.dependencies.is_empty(), "{name}");
+            let [
+                Failure::ReservedDependencyName {
+                    name: given,
+                    placeholder,
+                },
+            ] = t.setup.as_slice()
+            else {
+                panic!("{name}: {:?}", t.setup);
+            };
+            assert_eq!((given.as_str(), placeholder.as_str()), (name, reserved));
+            let message = t.setup[0].to_string();
+            assert!(
+                message.contains(&format!("`{name}`")) && message.contains(reserved),
+                "{message}"
+            );
+        }
+
+        let mut t = TestCases::new("/w", "host");
+        t.dependency_path("my-crate", ".");
+        t.dependency_path("rusty", "../rusty");
+        assert!(t.setup.is_empty(), "{:?}", t.setup);
+        assert_eq!(t.dependencies.len(), 2);
+    }
+
+    /// A refused dependency stops the run before anything is built, rather than
+    /// building the fixtures without it and, when blessing, recording that.
+    #[test]
+    fn a_refused_dependency_stops_the_run_before_the_build() {
+        let mut t = TestCases::new("/nonexistent-base", "host");
+        t.dependency_path("rust", "helper");
+        t.compile_fail("ui/a.rs");
+        let outcome = t.overwrite(true).run();
+        assert!(outcome.cases().is_empty(), "{}", outcome.report());
+        assert!(
+            matches!(
+                outcome.setup_failures(),
+                [Failure::ReservedDependencyName { .. }]
+            ),
+            "{}",
+            outcome.report()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_fixture_path_is_refused_rather_than_converted_lossily() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // Converted lossily, these two were one bin name and cargo refused the
+        // whole manifest.
+        let mut t = TestCases::new("/w", "host");
+        t.compile_fail(OsStr::from_bytes(b"ui/a\x80.rs"));
+        t.compile_fail(OsStr::from_bytes(b"ui/a\x81.rs"));
+        t.compile_fail("ui/fine.rs");
+        let names: Vec<&str> = t.cases.iter().map(|c| c.relative.as_str()).collect();
+        assert_eq!(names, ["ui/fine.rs"]);
+        let [
+            Failure::NonUtf8Fixture { fixture: first },
+            Failure::NonUtf8Fixture { fixture: second },
+        ] = t.setup.as_slice()
+        else {
+            panic!("{:?}", t.setup);
+        };
+        // Kept exactly, so the two stay distinguishable.
+        assert_eq!(first.as_os_str().as_bytes(), b"ui/a\x80.rs");
+        assert_eq!(second.as_os_str().as_bytes(), b"ui/a\x81.rs");
+        assert!(t.setup[0].to_string().contains("not valid UTF-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_dependency_path_is_refused() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut t = TestCases::new("/w", "host");
+        t.dependency_path("dep", OsStr::from_bytes(b"../dep-\xff"));
+        assert!(t.dependencies.is_empty());
+        let [Failure::NonUtf8Dependency { name, path }] = t.setup.as_slice() else {
+            panic!("{:?}", t.setup);
+        };
+        assert_eq!(name, "dep");
+        assert_eq!(path.as_os_str().as_bytes(), b"/dep-\xff");
     }
 
     #[test]

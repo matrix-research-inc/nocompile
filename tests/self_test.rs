@@ -649,6 +649,308 @@ fn a_missing_fixture_directory_is_reported() {
     );
 }
 
+/// Registering one fixture more than once -- a directory and a file inside it,
+/// the same directory twice -- runs it once. Each registration used to be a
+/// `[[bin]]` of the same name, and cargo refused the manifest for the whole run.
+#[test]
+fn a_fixture_registered_twice_runs_once() {
+    let sandbox = Sandbox::new("registered-twice");
+    sandbox.write("ui/rejected.rs", REJECTED);
+
+    let mut t = sandbox.cases();
+    t.compile_fail_dir("ui");
+    t.compile_fail("ui/rejected.rs");
+    t.compile_fail("./ui/rejected.rs");
+    t.compile_fail_dir("ui");
+
+    let outcome = t.overwrite(true).run();
+    assert_passed(&outcome);
+    assert_eq!(outcome.cases().len(), 1, "{}", outcome.report());
+}
+
+/// One directory registered under both kinds cannot be de-duplicated, since the
+/// assertions contradict each other. Each fixture is named, and the rest of the
+/// run still happens under the first registration.
+#[test]
+fn a_fixture_registered_under_both_kinds_is_reported() {
+    let sandbox = Sandbox::new("registered-both-kinds");
+    sandbox.write("ui/accepted.rs", ACCEPTED);
+
+    let mut t = sandbox.cases();
+    t.pass_dir("ui");
+    t.compile_fail_dir("ui");
+
+    let outcome = t.run();
+    assert!(!outcome.is_success());
+    let [Failure::ConflictingRegistration { fixture, .. }] = outcome.setup_failures() else {
+        panic!("{}", outcome.report());
+    };
+    assert_eq!(fixture, Path::new("ui/accepted.rs"));
+    assert_eq!(outcome.cases().len(), 1);
+    assert!(outcome.cases()[0].is_success(), "{}", outcome.report());
+    assert!(
+        outcome
+            .report()
+            .contains("ui/accepted.rs is registered as both pass and compile_fail"),
+        "{}",
+        outcome.report()
+    );
+}
+
+/// A fixture filed into a subdirectory of a registered directory is not
+/// registered by it, and used to be skipped without a word while the rest of
+/// the suite passed. Registering the subdirectory settles it, whichever order
+/// the two registrations come in.
+#[test]
+fn a_fixture_in_an_unregistered_subdirectory_fails_the_run() {
+    let sandbox = Sandbox::new("nested-fixture");
+    sandbox.write("ui/top.rs", REJECTED);
+    sandbox.write("ui/sub/hidden.rs", REJECTED);
+    sandbox.write("ui/sub/deeper/also_hidden.rs", ACCEPTED);
+    sandbox.write("ui/sub/notes.txt", "not a fixture");
+
+    let mut t = sandbox.cases();
+    t.compile_fail_dir("ui");
+    let outcome = t.overwrite(true).run();
+    assert!(!outcome.is_success());
+    let [
+        Failure::UnregisteredFixtures {
+            directory,
+            fixtures,
+        },
+    ] = outcome.setup_failures()
+    else {
+        panic!("{}", outcome.report());
+    };
+    assert_eq!(directory, Path::new("ui"));
+    assert_eq!(
+        fixtures,
+        &[
+            PathBuf::from("ui/sub/deeper/also_hidden.rs"),
+            PathBuf::from("ui/sub/hidden.rs"),
+        ]
+    );
+    let report = outcome.report();
+    assert!(report.contains("not recursive"), "{report}");
+    // The top-level fixture still ran; only the nested ones are missing.
+    assert_eq!(outcome.cases().len(), 1);
+    assert!(outcome.cases()[0].is_success(), "{report}");
+
+    // The subdirectory's own registration, after the parent's, covers the
+    // file directly in it and reports the one below that against itself.
+    let mut t = sandbox.cases();
+    t.compile_fail_dir("ui");
+    t.compile_fail_dir("ui/sub");
+    let outcome = t.overwrite(true).run();
+    let [
+        Failure::UnregisteredFixtures {
+            directory,
+            fixtures,
+        },
+    ] = outcome.setup_failures()
+    else {
+        panic!("{}", outcome.report());
+    };
+    assert_eq!(directory, Path::new("ui/sub"));
+    assert_eq!(fixtures, &[PathBuf::from("ui/sub/deeper/also_hidden.rs")]);
+
+    // And before it, with every level registered, nothing is left over.
+    let mut t = sandbox.cases();
+    t.pass_dir("ui/sub/deeper");
+    t.compile_fail_dir("ui");
+    t.compile_fail_dir("ui/sub");
+    assert_passed(&t.overwrite(true).run());
+    assert_passed(&t.overwrite(false).run());
+}
+
+/// A directory whose fixtures are all nested is reported as contributing none
+/// of them, not as empty, alongside the files it did not register.
+#[test]
+fn a_directory_with_only_nested_fixtures_is_not_called_empty() {
+    let sandbox = Sandbox::new("only-nested");
+    sandbox.write("ui/sub/a.rs", REJECTED);
+
+    let mut t = sandbox.cases();
+    t.compile_fail_dir("ui");
+    let outcome = t.run();
+    assert!(
+        matches!(
+            outcome.setup_failures(),
+            [
+                Failure::NoFixtures { .. },
+                Failure::UnregisteredFixtures { .. }
+            ]
+        ),
+        "{}",
+        outcome.report()
+    );
+    let report = outcome.report();
+    assert!(
+        report.contains("no .rs fixtures directly in ui"),
+        "{report}"
+    );
+    assert!(report.contains("ui/sub/a.rs"), "{report}");
+}
+
+/// A golden with no registered `compile_fail` fixture beside it -- the fixture
+/// renamed, deleted, or registered as a pass fixture -- is reported by name. A
+/// blessing run reports it too, and leaves it where it is.
+#[test]
+fn an_orphan_golden_fails_the_run_and_is_never_deleted() {
+    let sandbox = Sandbox::new("orphan-golden");
+    sandbox.write("ui/rejected.rs", REJECTED);
+    sandbox.write("ui/renamed_away.stderr", "error: stale\n");
+    sandbox.write("ui-pass/accepted.rs", ACCEPTED);
+    sandbox.write(
+        "ui-pass/accepted.stderr",
+        "error: a pass fixture has none\n",
+    );
+
+    let mut t = sandbox.cases();
+    t.compile_fail_dir("ui");
+    t.pass_dir("ui-pass");
+    for overwrite in [true, false] {
+        let outcome = t.overwrite(overwrite).run();
+        let goldens: Vec<&Path> = outcome
+            .setup_failures()
+            .iter()
+            .map(|failure| match failure {
+                Failure::OrphanGolden { golden } => golden.as_path(),
+                other => panic!("expected OrphanGolden, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            goldens,
+            [
+                Path::new("ui/renamed_away.stderr"),
+                Path::new("ui-pass/accepted.stderr")
+            ]
+        );
+        assert!(
+            outcome.cases().iter().all(|case| case.is_success()),
+            "{}",
+            outcome.report()
+        );
+        assert!(
+            outcome.report().contains("never deletes a golden"),
+            "{}",
+            outcome.report()
+        );
+        assert!(sandbox.path("ui/renamed_away.stderr").exists());
+        assert!(sandbox.path("ui-pass/accepted.stderr").exists());
+    }
+}
+
+/// A golden beside an unregistered fixture is that fixture's problem, reported
+/// once as such rather than a second time as an orphan.
+#[test]
+fn a_golden_beside_an_unregistered_fixture_is_not_also_an_orphan() {
+    let sandbox = Sandbox::new("orphan-beside-nested");
+    sandbox.write("ui/top.rs", REJECTED);
+    sandbox.write("ui/sub/nested.rs", REJECTED);
+    sandbox.write("ui/sub/nested.stderr", "error: whatever it was\n");
+
+    let mut t = sandbox.cases();
+    t.compile_fail_dir("ui");
+    let outcome = t.overwrite(true).run();
+    assert!(
+        matches!(
+            outcome.setup_failures(),
+            [Failure::UnregisteredFixtures { .. }]
+        ),
+        "{}",
+        outcome.report()
+    );
+}
+
+/// A bare key in raw manifest text would have become metadata of the last
+/// fixture's bin, silently. It is refused, and nothing is built -- so a
+/// blessing run cannot write goldens against a manifest other than the one
+/// asked for.
+#[test]
+fn raw_manifest_lines_without_a_table_header_are_refused() {
+    let sandbox = Sandbox::new("raw-without-header");
+    sandbox.write("ui/rejected.rs", REJECTED);
+
+    let mut t = sandbox.cases();
+    t.compile_fail("ui/rejected.rs");
+    t.raw_manifest_lines("foo = \"bar\"");
+
+    let outcome = t.overwrite(true).run();
+    let [Failure::RawManifestLinesWithoutHeader { line }] = outcome.setup_failures() else {
+        panic!("{}", outcome.report());
+    };
+    assert_eq!(line, "foo = \"bar\"");
+    assert!(outcome.cases().is_empty(), "{}", outcome.report());
+    assert!(outcome.report().contains("foo = \"bar\""));
+    assert!(
+        !sandbox.path("ui/rejected.stderr").exists(),
+        "a golden was blessed with part of the manifest refused"
+    );
+}
+
+/// A dependency whose placeholder would be one normalization already uses is
+/// refused by name, and nothing is built.
+#[test]
+fn a_dependency_named_like_a_reserved_placeholder_is_refused() {
+    let sandbox = Sandbox::new("reserved-dependency");
+    sandbox.write(
+        "rust/Cargo.toml",
+        "[package]\nname = \"rust\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    );
+    sandbox.write("rust/src/lib.rs", "pub fn small() -> u8 {\n    0\n}\n");
+    sandbox.write(
+        "ui/rejected.rs",
+        "fn main() {\n    let _x: String = rust::small();\n}\n",
+    );
+
+    let mut t = sandbox.cases();
+    t.dependency_path("rust", "rust");
+    t.compile_fail("ui/rejected.rs");
+
+    let outcome = t.overwrite(true).run();
+    let [Failure::ReservedDependencyName { name, placeholder }] = outcome.setup_failures() else {
+        panic!("{}", outcome.report());
+    };
+    assert_eq!((name.as_str(), placeholder.as_str()), ("rust", "$RUST"));
+    assert!(outcome.cases().is_empty(), "{}", outcome.report());
+    assert!(!sandbox.path("ui/rejected.stderr").exists());
+}
+
+/// A directory holding a fixture whose name is not UTF-8 refuses that fixture
+/// by name and runs the rest. Converted lossily, two such names used to become
+/// one bin, and cargo refused the whole manifest.
+///
+/// Linux only: macOS and Windows filesystems cannot hold such a name at all.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fixture_directory_with_a_non_utf8_name_refuses_just_that_fixture() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let sandbox = Sandbox::new("non-utf8-fixture");
+    sandbox.write("ui/rejected.rs", REJECTED);
+    let ui = sandbox.path("ui");
+    fs::write(ui.join(OsStr::from_bytes(b"a\x80.rs")), REJECTED).expect("write fixture");
+    fs::write(ui.join(OsStr::from_bytes(b"a\x81.rs")), REJECTED).expect("write fixture");
+
+    let mut t = sandbox.cases();
+    t.compile_fail_dir("ui");
+    let outcome = t.overwrite(true).run();
+
+    let refused: Vec<&[u8]> = outcome
+        .setup_failures()
+        .iter()
+        .map(|failure| match failure {
+            Failure::NonUtf8Fixture { fixture } => fixture.as_os_str().as_bytes(),
+            other => panic!("expected NonUtf8Fixture, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(refused, [&b"ui/a\x80.rs"[..], &b"ui/a\x81.rs"[..]]);
+    assert_eq!(outcome.cases().len(), 1);
+    assert!(outcome.cases()[0].is_success(), "{}", outcome.report());
+}
+
 /// The declared-dependency path (D2), end to end: a fixture can use the crate
 /// under test, and only the crates the caller named.
 #[test]
@@ -912,7 +1214,7 @@ fn a_cargo_failure_is_not_reported_as_a_diagnostic() {
     let mut t = sandbox.cases();
     t.compile_fail("ui/rejected.rs");
     t.compile_fail("ui/other.rs");
-    t.raw_manifest_lines("this is not valid toml [[[");
+    t.raw_manifest_lines("[features]\nthis is not valid toml [[[");
 
     let outcome = t.overwrite(true).run();
     assert!(!outcome.is_success());

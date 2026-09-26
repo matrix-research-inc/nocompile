@@ -73,36 +73,68 @@ impl Layout {
 
 /// Find the target directory the outer build is using.
 ///
-/// `CARGO_TARGET_DIR` wins when it is set. Otherwise the test binary's own path
-/// is walked upward for cargo's `CACHEDIR.TAG`, which correctly handles both a
-/// workspace (where the target directory is at the workspace root, not the
+/// An absolute `CARGO_TARGET_DIR` wins: it names one directory however it is
+/// read. Otherwise the test binary's own path is walked upward for cargo's
+/// `CACHEDIR.TAG`. The binary sits inside the target directory cargo actually
+/// used, so what the walk finds is authoritative, and it correctly handles both
+/// a workspace (where the target directory is at the workspace root, not the
 /// member) and a `--target <triple>` build (where an extra component sits
 /// between the profile directory and the target directory).
+///
+/// A relative `CARGO_TARGET_DIR` defers to the walk because it cannot be
+/// resolved here the way cargo resolved it. Cargo read it against the directory
+/// it was invoked from, which a test process cannot recover; the working
+/// directory it gives a test binary is the package root instead, and in a
+/// workspace invoked from its root those differ. Resolving against the working
+/// directory put the scratch project in a new directory in the source tree,
+/// which nothing ever cleaned. Only when the walk finds nothing is the relative
+/// value resolved, against the manifest directory, which is at least inside
+/// the package.
 ///
 /// Every result is folded through [`lexical_join`], which is load-bearing here
 /// rather than cosmetic: the manifest path under this directory is what every
 /// diagnostic is attributed by, and a `..` left in it is a `..` cargo folds away
 /// before reporting it back. See that function for what the mismatch costs. A
-/// relative `CARGO_TARGET_DIR` of `../shared-target` is the ordinary way to
-/// acquire one.
+/// `CARGO_TARGET_DIR` of `../shared-target` is the ordinary way to acquire one.
 fn target_dir(manifest_dir: &Path) -> PathBuf {
-    // `lexical_join` ignores its base for an absolute path, so both spellings of
-    // the variable are handled by resolving against the working directory.
-    if let Some(dir) = env::var_os("CARGO_TARGET_DIR") {
-        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        return lexical_join(&cwd, Path::new(&dir));
-    }
-
-    let tagged = env::current_exe().ok().and_then(|exe| {
-        exe.ancestors()
-            .skip(1)
-            .find(|ancestor| ancestor.join("CACHEDIR.TAG").is_file())
-            .map(Path::to_path_buf)
-    });
-    lexical_join(
+    choose_target_dir(
         manifest_dir,
-        &tagged.unwrap_or_else(|| manifest_dir.join("target")),
+        env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
+        || {
+            env::current_exe()
+                .ok()
+                .and_then(|exe| tagged_ancestor(&exe))
+        },
     )
+}
+
+/// The decision [`target_dir`] makes, apart from the environment it reads.
+///
+/// `tagged` is the walk, taken as a closure so it touches the filesystem only
+/// when an absolute `configured` has not already settled the answer.
+fn choose_target_dir(
+    manifest_dir: &Path,
+    configured: Option<PathBuf>,
+    tagged: impl FnOnce() -> Option<PathBuf>,
+) -> PathBuf {
+    let chosen = match configured {
+        Some(configured) if configured.is_absolute() => configured,
+        // `lexical_join` below resolves a relative fallback against the
+        // manifest directory.
+        configured => tagged()
+            .or(configured)
+            .unwrap_or_else(|| manifest_dir.join("target")),
+    };
+    lexical_join(manifest_dir, &chosen)
+}
+
+/// The nearest directory above `exe` holding cargo's `CACHEDIR.TAG`, which
+/// cargo writes at the root of every target directory it creates.
+fn tagged_ancestor(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.join("CACHEDIR.TAG").is_file())
+        .map(Path::to_path_buf)
 }
 
 /// Keep a package name usable as a single path component.
@@ -407,6 +439,60 @@ mod tests {
             "{}",
             l.manifest().display()
         );
+    }
+
+    #[test]
+    fn an_absolute_target_dir_wins_without_walking() {
+        // `/t` has no drive, so on Windows it is not absolute.
+        let (configured, expected) = if cfg!(windows) {
+            (r"C:\shared\..\t", r"C:\t")
+        } else {
+            ("/shared/../t", "/t")
+        };
+        let chosen = choose_target_dir(Path::new("/w/member"), Some(configured.into()), || {
+            panic!("an absolute CARGO_TARGET_DIR needs no walk")
+        });
+        assert_eq!(chosen, Path::new(expected));
+    }
+
+    /// The case that used to go wrong: cargo resolved the relative value against
+    /// where it was invoked, and the binary it built says where that was.
+    #[test]
+    fn a_relative_target_dir_defers_to_the_binary_cargo_built() {
+        let chosen = choose_target_dir(
+            Path::new("/ws/member"),
+            Some("../shared-target".into()),
+            || Some("/shared-target".into()),
+        );
+        assert_eq!(chosen, Path::new("/shared-target"));
+    }
+
+    /// With no tag to find, a relative value lands inside the package rather
+    /// than wherever the process happens to be running.
+    #[test]
+    fn a_relative_target_dir_falls_back_to_the_manifest_dir() {
+        let chosen = choose_target_dir(Path::new("/ws/member"), Some("out/../t".into()), || None);
+        assert_eq!(chosen, Path::new("/ws/member/t"));
+    }
+
+    #[test]
+    fn with_nothing_configured_or_tagged_the_target_dir_is_the_packages_own() {
+        let chosen = choose_target_dir(Path::new("/w"), None, || None);
+        assert_eq!(chosen, Path::new("/w/target"));
+    }
+
+    /// This test binary was built by cargo, so the walk has a real tag to find,
+    /// and it has to be above the binary rather than the binary's own path.
+    #[test]
+    fn the_walk_finds_the_target_dir_this_binary_was_built_into() {
+        let exe = env::current_exe().expect("current_exe");
+        let tagged = tagged_ancestor(&exe).expect("a CACHEDIR.TAG above the test binary");
+        assert!(
+            exe.starts_with(&tagged) && exe != tagged,
+            "{}",
+            tagged.display()
+        );
+        assert!(tagged.join("CACHEDIR.TAG").is_file());
     }
 
     #[test]
