@@ -152,7 +152,8 @@ pub(crate) struct Normalizer {
     scratch_root: String,
     /// Absolute path of the host crate's manifest directory.
     manifest_dir: String,
-    /// `CARGO_HOME`, if it can be determined.
+    /// `CARGO_HOME`, if it can be determined, spelled as [`cargo_home_dir`]
+    /// spells it: only a root ends in a separator.
     cargo_home: Option<String>,
     /// The toolchain's sysroot, if `rustc` would say.
     sysroot: Option<String>,
@@ -189,7 +190,7 @@ impl Normalizer {
             bin: bin.to_string(),
             scratch_root: fold_separators(scratch_root),
             manifest_dir: fold_separators(manifest_dir),
-            cargo_home: cargo_home().map(|home| fold_separators(&home)),
+            cargo_home: cargo_home().map(|home| cargo_home_dir(&home)),
             sysroot: sysroot().map(str::to_string),
             dependencies,
             elide_implementors: false,
@@ -247,6 +248,13 @@ impl Normalizer {
                 }
             }
 
+            // Again, because the rules above can leave whitespace at the end
+            // that was not at the end before: blanking a row that held nothing
+            // but its number, or dropping the `:line` that followed a space.
+            // The next pass would trim it, and a golden that normalizes
+            // differently the second time it is read is one re-blessing edits
+            // for no reason.
+            line.truncate(line.trim_end().len());
             lines.push(line);
         }
 
@@ -306,11 +314,15 @@ impl Normalizer {
         };
         let line = replace_sysroot(&line);
 
+        // The registry under a root `CARGO_HOME` is still one directory with a
+        // hash in it, so that rule takes the home whole; only the placeholder
+        // for the home itself needs it to be something other than a root.
         let line = match &self.cargo_home {
-            Some(home) => {
-                let line = replace_registry_src(&line, home);
-                replace_dir(&line, home, CARGO_HOME)
-            }
+            Some(home) => replace_registry_src(&line, home),
+            None => line,
+        };
+        let line = match self.cargo_home_placeholder_dir() {
+            Some(home) => replace_dir(&line, home, CARGO_HOME),
             None => line,
         };
 
@@ -368,22 +380,46 @@ impl Normalizer {
         if find_rustc_commit(line).is_some() {
             return true;
         }
+        // This and the two anchors above are matched anywhere in the line,
+        // which is also how their rewrites match them, so a line they claim
+        // is a line that gets rewritten.
         if line.contains(&self.scratch_relative) {
             return true;
         }
 
-        // `scratch_absolute` sits inside `scratch_root`, so the root covers it.
-        // An empty anchor would match every line and fold all of it, and
-        // `CARGO_HOME` set to the empty string is the one way to reach that.
+        // The directories, by contrast, are rewritten only where they are a
+        // whole path prefix, so they must be found the same way here. A
+        // sibling that merely shares a prefix -- `C:\Users\u\wrong` beside the
+        // manifest dir `C:\Users\u\w` -- is left alone by the rewrite, and
+        // folding its line anyway would turn any escape beside it into a
+        // slash with nothing substituted to show for it.
+        //
+        // `scratch_absolute` sits inside `scratch_root`, so the root covers it,
+        // and the registry sits inside `CARGO_HOME`.
         [
-            Some(&self.scratch_root),
-            Some(&self.manifest_dir),
-            self.cargo_home.as_ref(),
+            Some(self.scratch_root.as_str()),
+            Some(self.manifest_dir.as_str()),
+            self.cargo_home_placeholder_dir(),
         ]
         .into_iter()
         .flatten()
-        .chain(self.dependencies.iter().map(|(path, _)| path))
-        .any(|anchor| !anchor.is_empty() && line.contains(anchor.as_str()))
+        .chain(self.dependencies.iter().map(|(path, _)| path.as_str()))
+        .any(|anchor| dir_matches(line, anchor).next().is_some())
+    }
+
+    /// The directory `$CARGO_HOME` stands for, unless it is a root.
+    ///
+    /// Every path under a root continues past its separator with a component,
+    /// and `replace_dir` rightly refuses a match that runs into one. What a
+    /// root needle *can* match is the rest: `/` before another `/`, which
+    /// turns `https://` into `https:$CARGO_HOME/` and folds any line holding
+    /// one. A placeholder for a root could not say anything useful anyway,
+    /// every absolute path being under it.
+    fn cargo_home_placeholder_dir(&self) -> Option<&str> {
+        // `cargo_home_dir` keeps a separator at the end of a root only.
+        self.cargo_home
+            .as_deref()
+            .filter(|home| !home.ends_with('/'))
     }
 }
 
@@ -403,27 +439,39 @@ fn fold_separators(path: &Path) -> String {
 /// nor a portable one. The sibling checkout is exactly the case these
 /// placeholders exist for, so the prefix has to be anchored.
 fn replace_dir(line: &str, from: &str, to: &str) -> String {
-    // `rest.find("")` returns `Some(0)` without consuming anything, so an empty
-    // `from` would spin forever rather than merely doing nothing.
-    if from.is_empty() {
-        return line.to_string();
-    }
-
     let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    let mut consumed = 0;
-    while let Some(at) = rest.find(from) {
-        let after = &rest[at + from.len()..];
-        let anchored = ends_component(after.chars().next())
-            && starts_component(line[..consumed + at].chars().next_back());
-
-        out.push_str(&rest[..at]);
-        out.push_str(if anchored { to } else { from });
-        consumed += at + from.len();
-        rest = after;
+    let mut copied = 0;
+    for at in dir_matches(line, from) {
+        out.push_str(&line[copied..at]);
+        out.push_str(to);
+        copied = at + from.len();
     }
-    out.push_str(rest);
+    out.push_str(&line[copied..]);
     out
+}
+
+/// Where `dir` occurs in `line` as a whole path prefix, as byte offsets.
+///
+/// The one statement of what counts as a match, shared by `replace_dir` and
+/// the fold's anchor, so a line is never folded for a directory the rewrite
+/// then declines to substitute.
+///
+/// Occurrences are found left to right without overlapping, as
+/// `str::match_indices` finds them, and one that is not anchored is skipped
+/// rather than cut short.
+fn dir_matches<'a>(line: &'a str, dir: &'a str) -> impl Iterator<Item = usize> + 'a {
+    // An empty `dir` occurs at every character boundary, and a path that is
+    // nothing names nothing. `CARGO_HOME` set to the empty string is the one
+    // way to reach it, and it must stay inert rather than claim every line.
+    let dir = (!dir.is_empty()).then_some(dir);
+    dir.into_iter().flat_map(move |dir| {
+        line.match_indices(dir)
+            .map(|(at, _)| at)
+            .filter(move |&at| {
+                starts_component(line[..at].chars().next_back())
+                    && ends_component(line[at + dir.len()..].chars().next())
+            })
+    })
 }
 
 /// Whether the character *before* a match lets it start a path.
@@ -1025,15 +1073,55 @@ fn replace_sysroot(line: &str) -> String {
 /// The sysroot prefix is machine-specific all the way back to the root, so the
 /// whole of it has to go, and the only way to find its start in a line of prose
 /// is to walk back to something that cannot be inside a path.
+///
+/// Nothing truly cannot: every character [`precedes_a_path`] stops at is legal
+/// in a file name. So the question is which way to be wrong. Stopping too early
+/// keeps part of a toolchain path in the golden, visibly, and a known sysroot
+/// matched as a prefix gets it right anyway. Running past the path's start
+/// deletes the prose before it -- `note:` with the path glued on -- and a
+/// golden missing words compares as happily as a whole one. So the walk stops
+/// at anything a path gets glued to in a diagnostic.
+///
+/// The exception is the colon of a Windows drive, which is part of the path it
+/// follows: stopping there would leave the drive letter behind, `C:$RUST/...`.
 fn path_start(line: &str, at: usize) -> usize {
     line[..at]
         .char_indices()
         .rev()
-        .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '`' | '"' | '\'' | '(' | '<' | '='))
+        .find(|&(index, ch)| precedes_a_path(ch) && !is_drive_colon(line, index))
         .map_or(0, |(index, ch)| index + ch.len_utf8())
 }
 
-/// Rewrite `/rustc/<40 hex>/library/` to `$RUST/`.
+/// Whether a character can sit directly before a path in rustc's prose, and so
+/// ends a walk back through one.
+///
+/// Whitespace, the quotes and brackets a path is wrapped in, the `=` of a
+/// `key=value`, the separators of a list, and the `:` ending a label such as
+/// `note:`.
+fn precedes_a_path(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '`' | '"' | '\'' | '(' | '[' | '{' | '<' | '=' | ',' | ';' | ':'
+        )
+}
+
+/// Whether the byte at `index` is a Windows drive's colon, as in `C:\Users`.
+///
+/// One ASCII letter before it, starting the path, and a separator after it. Two
+/// letters make it the end of a word, `ab:`, and no separator makes it `C:foo`, a
+/// drive-relative path rustc does not print; either way it is prose.
+fn is_drive_colon(line: &str, index: usize) -> bool {
+    let mut before = line[..index].chars().rev();
+    line[index..].starts_with(':')
+        && before
+            .next()
+            .is_some_and(|letter| letter.is_ascii_alphabetic())
+        && before.next().is_none_or(precedes_a_path)
+        && line[index + 1..].starts_with(['/', '\\'])
+}
+
+/// Rewrite `/rustc/<commit>/library/` to `$RUST/`.
 ///
 /// Self-delimiting, unlike the sysroot markers: the path starts at `/rustc/`, so
 /// there is nothing to walk back over.
@@ -1050,7 +1138,7 @@ fn replace_rustc_commit(line: &str) -> String {
     out
 }
 
-/// Where the first `/rustc/<40 hex>/library/` in `text` starts, and where it
+/// Where the first `/rustc/<commit>/library/` in `text` starts, and where it
 /// ends.
 ///
 /// The one statement of what that prefix looks like, so the rewrite and the
@@ -1058,14 +1146,19 @@ fn replace_rustc_commit(line: &str) -> String {
 fn find_rustc_commit(text: &str) -> Option<(usize, usize)> {
     const PREFIX: &str = "/rustc/";
     const SUFFIX: &str = "/library/";
-    const COMMIT_LEN: usize = 40;
+    // A full hash, never an abbreviated one. That is forty hex digits for the
+    // SHA-1 commits rustc is built from today and sixty-four for a SHA-256
+    // repository, so the length is a floor, and the day rustc moves to one is
+    // not the day every golden touching std stops being portable. A shorter
+    // run could be any directory, `/rustc/short/library`, and is left alone.
+    const SHORTEST_COMMIT: usize = 40;
 
     let mut from = 0;
     while let Some(found) = text[from..].find(PREFIX) {
         let start = from + found;
         let after = &text[start + PREFIX.len()..];
         let commit = after.bytes().take_while(u8::is_ascii_hexdigit).count();
-        if commit == COMMIT_LEN && after[commit..].starts_with(SUFFIX) {
+        if commit >= SHORTEST_COMMIT && after[commit..].starts_with(SUFFIX) {
             return Some((start, start + PREFIX.len() + commit + SUFFIX.len()));
         }
         // Not a commit directory. Step past the prefix so the scan advances.
@@ -1104,9 +1197,10 @@ fn replace_registry_src(line: &str, cargo_home: &str) -> String {
 ///
 /// Knowing the path turns finding it in a line of prose from a guess into a
 /// prefix match, and the guess cannot be made right. `path_start` walks back
-/// from the marker inside the path to the nearest whitespace, because in prose
-/// there is nothing else to walk back to -- so a toolchain under a directory
-/// whose name holds a space keeps everything up to that space:
+/// from the marker inside the path to the nearest whitespace or delimiter,
+/// because in prose there is nothing else to walk back to -- so a toolchain
+/// under a directory whose name holds a space keeps everything up to that
+/// space:
 ///
 /// ```text
 ///  --> /Users/My Name/.rustup/toolchains/stable/lib/rustlib/src/rust/library/core/src/clone.rs
@@ -1141,6 +1235,26 @@ fn sysroot() -> Option<&'static str> {
             Some(fold_separators(Path::new(root)))
         })
         .as_deref()
+}
+
+/// `CARGO_HOME` as the rewrites match it: `/`-separated, and with no separator
+/// at the end.
+///
+/// `replace_dir` anchors a match on the character after it, so a needle ending
+/// in a separator can never match: what follows it is the first byte of the
+/// next component. And the value does arrive that way -- cargo passes
+/// `CARGO_HOME=/home/u/.cargo/` through to the test process verbatim.
+///
+/// A root keeps its separator, because without it the root names something
+/// else: `/` would become the empty string, and `C:\` the current directory of
+/// drive `C:`. See [`Normalizer::cargo_home_placeholder_dir`] for what a root
+/// does get substituted.
+fn cargo_home_dir(home: &Path) -> String {
+    let folded = fold_separators(home);
+    if home.parent().is_none() {
+        return folded;
+    }
+    folded.trim_end_matches('/').to_string()
 }
 
 /// `CARGO_HOME` if set, else the conventional `~/.cargo`.
@@ -1221,6 +1335,41 @@ mod tests {
     fn rewrites_other_cargo_home_paths() {
         let out = normalizer().normalize("note: /home/u/.cargo/git/checkouts/x\n", "f.rs");
         assert_eq!(out, "note: $CARGO_HOME/git/checkouts/x\n");
+    }
+
+    /// Cargo passes `CARGO_HOME=/home/u/.cargo/` through verbatim, and a needle
+    /// ending in `/` can never be followed by the boundary `replace_dir` needs.
+    /// Only the registry rule, which trims its own, survived it.
+    #[test]
+    fn a_cargo_home_with_a_trailing_separator_still_matches() {
+        assert_eq!(
+            cargo_home_dir(Path::new("/home/u/.cargo//")),
+            "/home/u/.cargo"
+        );
+        let mut n = normalizer();
+        n.cargo_home = Some(cargo_home_dir(Path::new("/home/u/.cargo/")));
+        let out = n.normalize("note: /home/u/.cargo/git/checkouts/x/y\n", "f.rs");
+        assert_eq!(out, "note: $CARGO_HOME/git/checkouts/x/y\n");
+    }
+
+    /// Trimmed, a root would name nothing at all. Kept whole, it still anchors
+    /// the registry rule, while the placeholder for the home itself -- which
+    /// could only ever match the junk after a root, like the second `/` of a
+    /// URL -- stays out of the way.
+    #[test]
+    fn a_root_cargo_home_keeps_its_registry_and_claims_nothing_else() {
+        assert_eq!(cargo_home_dir(Path::new("/")), "/");
+        assert_eq!(cargo_home_dir(Path::new("")), "");
+
+        let mut n = normalizer();
+        n.cargo_home = Some(cargo_home_dir(Path::new("/")));
+        let out = n.normalize(
+            "note: /registry/src/index-abc/dep-1.0/src/x.rs:3:1\n",
+            "f.rs",
+        );
+        assert_eq!(out, "note: $CARGO_REGISTRY/dep-1.0/src/x.rs:3:1\n");
+        let untouched = "note: see https://example.com/x and /git/checkouts/x\n";
+        assert_eq!(n.normalize(untouched, "f.rs"), untouched);
     }
 
     #[test]
@@ -1793,6 +1942,31 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_that_leaves_trailing_whitespace_does_not_break_idempotence() {
+        // Neither shape comes out of rustc today, which always follows a
+        // number with a gutter marker. Both leave whitespace at the end of a
+        // line after the trim at the top of the loop has run: dropping the
+        // line number from a span target that has a space before it, and
+        // blanking a snippet row that is nothing but its number.
+        let n = with_deps(&[("/elsewhere/core", "core")]);
+        for (rendered, expected) in [
+            ("::: 1008+ :10080\n", "::: 1008+\n"),
+            (
+                " --> /elsewhere/core/src/lib.rs:12:1\n12\n",
+                " --> $CORE/src/lib.rs\n",
+            ),
+        ] {
+            let once = n.normalize(rendered, "tests/ui/a.rs");
+            assert_eq!(once, expected, "{rendered:?}");
+            assert_eq!(
+                n.normalize(&once, "tests/ui/a.rs"),
+                once,
+                "normalizing twice must not differ from normalizing once"
+            );
+        }
+    }
+
+    #[test]
     fn a_free_standing_note_re_aligns_on_its_own() {
         // A post-monomorphization error arrives from cargo as three separate
         // rendered diagnostics, two of them at level `note`, each sized to its
@@ -1891,6 +2065,18 @@ mod tests {
     fn rewrites_a_distributed_toolchain_commit_path_to_rust() {
         let out = normalizer().normalize(
             " --> /rustc/0123456789abcdef0123456789abcdef01234567/library/core/src/mod.rs:9:1\n",
+            "tests/ui/a.rs",
+        );
+        assert_eq!(out, " --> $RUST/core/src/mod.rs\n");
+    }
+
+    /// Forty digits is a SHA-1 commit. A toolchain built from a SHA-256
+    /// repository prints sixty-four, and its std paths are just as virtual.
+    #[test]
+    fn rewrites_a_commit_path_with_a_sha256_commit() {
+        let commit = "0123456789abcdef".repeat(4);
+        let out = normalizer().normalize(
+            &format!(" --> /rustc/{commit}/library/core/src/mod.rs:9:1\n"),
             "tests/ui/a.rs",
         );
         assert_eq!(out, " --> $RUST/core/src/mod.rs\n");
@@ -2329,6 +2515,50 @@ mod tests {
         assert_eq!(out, " --> $RUST/core/src/clone.rs\n");
     }
 
+    /// The walk back from the marker used to stop only at whitespace and a few
+    /// quotes, so a path glued to a label took the label with it.
+    #[test]
+    fn an_unknown_sysroot_keeps_the_prose_before_it() {
+        let mut n = normalizer();
+        n.sysroot = None;
+        let out = n.normalize("note:/a/b/lib/rustlib/src/rust/library/core/x.rs\n", "f.rs");
+        assert_eq!(out, "note:$RUST/core/x.rs\n");
+    }
+
+    /// The colon the walk now stops at, except where it is a drive's.
+    #[test]
+    fn an_unknown_windows_sysroot_is_replaced_with_its_drive() {
+        let mut n = windows_normalizer();
+        n.sysroot = None;
+        for (rendered, expected) in [
+            (
+                " --> C:\\Users\\u\\.rustup\\toolchains\\stable\\lib\\rustlib\\src\\rust\\library\\core\\src\\clone.rs\n",
+                " --> $RUST/core/src/clone.rs\n",
+            ),
+            (
+                "C:\\Users\\u\\lib\\rustlib\\src\\rust\\library\\core\\x.rs\n",
+                "$RUST/core/x.rs\n",
+            ),
+        ] {
+            assert_eq!(n.normalize(rendered, "f.rs"), expected);
+        }
+    }
+
+    #[test]
+    fn path_start_stops_at_a_label_colon_but_not_a_drive_colon() {
+        let start = |line: &str| path_start(line, line.find("/lib/rustlib/").unwrap());
+        assert_eq!(start("note:/a/lib/rustlib/"), "note:".len());
+        assert_eq!(start("C:/a/lib/rustlib/"), 0);
+        assert_eq!(start("note: C:/a/lib/rustlib/"), "note: ".len());
+        assert_eq!(start("note:C:/a/lib/rustlib/"), "note:".len());
+        assert_eq!(start("(C:\\a/lib/rustlib/"), "(".len());
+        assert_eq!(start("[/a/lib/rustlib/"), "[".len());
+        assert_eq!(start("x,/a/lib/rustlib/"), "x,".len());
+        // Not a drive: two letters, or no separator after the colon.
+        assert_eq!(start("ab:/a/lib/rustlib/"), "ab:".len());
+        assert_eq!(start("C:a/lib/rustlib/"), "C:".len());
+    }
+
     /// A sysroot on Windows, where the space is the common case rather than the
     /// awkward one: `C:\Users\First Last`.
     #[test]
@@ -2379,6 +2609,21 @@ mod tests {
     fn folds_an_escape_sharing_a_line_with_a_path() {
         let out = windows_normalizer().normalize("note: D:\\w\\src\\lib.rs and \\d\n", "f.rs");
         assert_eq!(out, "note: $DIR/src/lib.rs and /d\n");
+    }
+
+    /// That cost is paid only where a substitution follows. A sibling that
+    /// merely shares a prefix with the manifest dir is not rewritten, so its
+    /// line must not be folded either: the fold used to test with an
+    /// unanchored `contains`, and turned the escape into `/d` for nothing.
+    #[test]
+    fn a_sibling_sharing_a_prefix_with_a_known_dir_keeps_its_backslashes() {
+        let mut n = windows_normalizer();
+        n.manifest_dir = "C:/Users/u/w".into();
+        let sibling = "note: C:\\Users\\u\\wrong\\src\\x.rs and \\d\n";
+        assert_eq!(n.normalize(sibling, "f.rs"), sibling);
+        // The directory itself still folds and substitutes.
+        let out = n.normalize("note: C:\\Users\\u\\w\\src\\x.rs and \\d\n", "f.rs");
+        assert_eq!(out, "note: $DIR/src/x.rs and /d\n");
     }
 
     #[test]
