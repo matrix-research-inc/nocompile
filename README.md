@@ -64,7 +64,7 @@ error[E0061]: this function takes 2 arguments but 1 argument was supplied
 --> tests/ui/wrong_arity.rs:2:4
 ```
 
-It drops only rustc's rendering (source snippets, underline art, `= note:` lines), so it still fails when a fixture stops failing or starts failing for a different reason. Both `Brief` modes filter both sides of the comparison, so existing `Exact` goldens pass unchanged after switching; re-bless to shrink them.
+It drops only rustc's rendering (source snippets, underline art, `= note:` and `= help:` lines), so it still fails when a fixture stops failing or starts failing for a different reason. Both `Brief` modes filter both sides of the comparison, so existing `Exact` goldens pass unchanged after switching; re-bless to shrink them.
 
 `compile_error!` has no error code, and a library cannot register one. If you want a stable, searchable code, put it in the message: `compile_error!("MYLIB-E001: ...")`. `Brief` compares the full message, so the code is asserted on every run.
 
@@ -76,11 +76,11 @@ More detail on each mode is in [DESIGN.md](DESIGN.md#comparison-modes).
 
 For the core job, asserting that code fails to compile for the intended reason, `nocompile` is the stronger harness:
 
-- **It catches guards a check-only suite misses.** Fixtures are built, not checked, so a `const { assert!(...) }` inside a generic function actually fires. `trybuild` runs `cargo check` unless the suite also has a `pass` fixture, and then passes that fixture without asserting anything ([details](DESIGN.md#build-not-check)).
+- **It catches guards a check-only suite misses.** Fixtures are built, not checked, so a `const { assert!(...) }` inside a generic function actually fires. `trybuild` runs `cargo check` unless the suite also has a `pass` fixture, so in a compile-fail-only suite such a guard never fires: its fixture is reported as having compiled, and the guard cannot be tested at all until an unrelated `pass` fixture switches the whole suite to `cargo build` ([details](DESIGN.md#build-not-check)).
 - **Its goldens survive toolchain upgrades.** `Brief` and `BriefLocal` compare what the fixture asserts and drop the rendering rustc reflows between releases ([above](#choosing-a-mode)). A `trybuild` golden is always the full rendering.
 - **Its goldens record only what the fixture is about.** A path dependency's own warnings stay with the dependency instead of being replayed into every fixture's golden, and implementor lists can be elided so that one new impl elsewhere does not re-bless unrelated tests ([details](DESIGN.md#eliding-the-list)).
 - **Its fixtures see only what you declare,** not every dev-dependency of the host crate, so a fixture cannot quietly lean on something the invariant never mentions ([details](DESIGN.md#declared-dependencies-not-inferred-ones)).
-- **Its goldens do not depend on your shell.** `RUSTFLAGS` and every `CARGO_PROFILE_*` variable are cleared for the fixture build, so an inherited `-D warnings` or `debug_assertions` override cannot change what a golden records ([details](DESIGN.md#a-controlled-build-environment)).
+- **Its goldens do not depend on your shell's build flags.** `RUSTFLAGS` and every `CARGO_PROFILE_*` variable are cleared for the fixture build, so an inherited `-D warnings` or `debug_assertions` override cannot change what a golden records. The toolchain itself still comes from your environment, as it does for the crate under test ([details](DESIGN.md#a-controlled-build-environment)).
 - **It adds nothing to your lockfile.** No dependencies, dev-dependencies included; its own compile-fail suite is run by itself. In one real workspace, `trybuild` was the only root of fifteen lock entries:
 
 ```
@@ -119,7 +119,7 @@ If a suite outgrows these limits, `trybuild` is the answer; this crate would rat
 
 **Environment**
 
-- `RUSTFLAGS` (including `[build] rustflags`) and every `CARGO_PROFILE_*` variable are cleared for the fixture build. A `[profile.dev]` in a committed `.cargo/config.toml` still applies.
+- `RUSTFLAGS` (including `[build] rustflags`) and every `CARGO_PROFILE_*` variable are cleared for the fixture build. A `[profile.dev]` in a committed `.cargo/config.toml` still applies, as do the variables that select the toolchain (`RUSTUP_TOOLCHAIN`, `RUSTC_BOOTSTRAP`, `CARGO_UNSTABLE_*`) or wrap rustc (`RUSTC_WRAPPER` and the like), exactly as for the crate under test.
 - Fixtures are built for the target the suite was built for, so a `no_std` crate can test invariants about its own target. Goldens are target-specific the same way they are toolchain-specific: bless them on the target CI uses, or use `Brief`.
 - Install the `rust-src` component wherever goldens are blessed and wherever they are checked. Without it, a diagnostic that points into the standard library renders differently. Most suites never hit this, a mismatch says so in its failure message, and `BriefLocal` avoids it entirely.
 - Linux, macOS and Windows. A golden blessed on one matches on the others, including one git checked out with CRLF line endings.
