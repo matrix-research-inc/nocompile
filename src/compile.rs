@@ -148,7 +148,8 @@ fn profile_keys(keys: impl Iterator<Item = OsString>) -> Vec<OsString> {
 
 /// Build every bin target of the scratch project in one invocation.
 pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
-    let output = fixture_build(layout, env::vars_os().map(|(key, _)| key)).output()?;
+    let inherited = env::vars_os().map(|(key, _)| key);
+    let output = fixture_build(layout, inherited, TARGET, HOST).output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let mut build = Build {
         messages: HashMap::new(),
@@ -175,7 +176,17 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
 /// [`build`] is this process's own. It is a parameter so that a test can supply
 /// an environment without `env::set_var`, which is `unsafe` in edition 2024 and
 /// would race every other test reading the environment.
-fn fixture_build(layout: &Layout, inherited: impl Iterator<Item = OsString>) -> Command {
+///
+/// `target` and `host` are the triples this crate was compiled for and on --
+/// [`TARGET`] and [`HOST`], in [`build`] -- and are parameters for the same
+/// reason: which of the two the fixtures are built for depends on whether they
+/// differ, and a test has to be able to reach both answers on one machine.
+fn fixture_build(
+    layout: &Layout,
+    inherited: impl Iterator<Item = OsString>,
+    target: &str,
+    host: &str,
+) -> Command {
     let mut command = Command::new(cargo());
 
     command
@@ -209,6 +220,28 @@ fn fixture_build(layout: &Layout, inherited: impl Iterator<Item = OsString>) -> 
         .arg(layout.manifest())
         .current_dir(&layout.project);
 
+    // The fixtures are built for the target the suite was, which is what lets a
+    // crate test invariants about its own target. Nothing at run time says what
+    // that was: `cargo test --target <triple>` does not export
+    // `CARGO_BUILD_TARGET` to the test binary, so without this the fixtures of
+    // a cross-compiled suite are built for the host, and judged against the
+    // host's diagnostics. See `TARGET` for where the triple comes from.
+    //
+    // Only when it is not the host, though cargo would accept the host's triple
+    // too. Naming any target moves cargo's output under a component for it
+    // (`$SCRATCH/target/<triple>/debug/...`), and a diagnostic can quote a path
+    // from there -- one naming a file in `OUT_DIR`, say -- so every host golden
+    // would become specific to the triple it was blessed on. It would also build
+    // what a dependency needs on the host (proc macros, build scripts) apart
+    // from what it needs on the target, for nothing. `trybuild` passes
+    // `--target` unconditionally, for a reason about flags: it forwards
+    // `RUSTFLAGS`, which cargo applies to host artifacts only when no target is
+    // named, so matching an outer build that named one means naming one too.
+    // This harness clears `RUSTFLAGS`, so the reason does not carry over.
+    if target != host {
+        command.arg("--target").arg(target);
+    }
+
     // An inherited `-D warnings` turns every fixture's warnings into errors and
     // silently changes what the goldens contain.
     //
@@ -237,14 +270,14 @@ fn fixture_build(layout: &Layout, inherited: impl Iterator<Item = OsString>) -> 
     //
     // `CARGO_BUILD_TARGET` is deliberately not swept with them, though it
     // reaches the goldens just as directly. It is not an incidental build knob:
-    // it says what platform the crate is for, and it is also what the test
-    // binary running this was built for, so following it is what keeps a fixture
-    // compiling the way the crate under test does. A `no_std` crate's
-    // compile-fail invariants are usually about its target -- a const guard
-    // asserting a 64-bit pointer can only be tested by building for a target
-    // that has one -- and forcing the host would quietly stop testing it.
-    // `trybuild` follows the same triple, by passing `--target` for the one it
-    // was itself compiled for.
+    // it says what platform the crate is for, and a fixture has to compile the
+    // way the crate under test does. A `no_std` crate's compile-fail invariants
+    // are usually about its target -- a const guard asserting a 64-bit pointer
+    // can only be tested by building for a target that has one -- and forcing
+    // the host would quietly stop testing it. It is not, however, what carries
+    // the suite's target across: `cargo test --target <triple>` does not export
+    // it, which is why the triple is passed as `--target` above whenever it is
+    // not the host's, and the flag outranks the variable.
     //
     // Before the two set below, which the sweep would otherwise take with it.
     for key in profile_keys(inherited) {
@@ -404,6 +437,17 @@ fn cargo() -> std::ffi::OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
 }
 
+/// The target triple this crate was compiled for.
+///
+/// Which is the triple the suite was compiled for, since this crate is linked
+/// into the test binary. Captured by `build.rs` because a build script is the
+/// only place cargo says what the target is: the test binary is told nothing,
+/// and `cfg` exposes a triple's parts but not the triple.
+const TARGET: &str = env!("NOCOMPILE_TARGET");
+
+/// The triple of the toolchain that compiled this crate. See [`TARGET`].
+const HOST: &str = env!("NOCOMPILE_HOST");
+
 /// The lockfile of the workspace the host crate belongs to, if it has one.
 ///
 /// The scratch project is a workspace of its own (hazard 2 in `scratch`), so
@@ -539,9 +583,9 @@ mod tests {
         // `RUSTC`, `RUSTUP_TOOLCHAIN` and `CARGO_BUILD_TARGET` in particular:
         // the fixtures must be built by the same compiler, for the same target,
         // as the crate under test, so what identifies those is exactly the part
-        // of the environment to keep. Sweeping the target would compile a
-        // `no_std` crate's fixtures for the host and quietly stop testing the
-        // invariant they exist for.
+        // of the environment to keep. The variable is not what carries a
+        // `cargo test --target` triple across, which cargo does not export; that
+        // arrives as `--target`, tested below.
         assert!(
             keys(&[
                 "CARGO",
@@ -557,11 +601,16 @@ mod tests {
         );
     }
 
-    /// The fixture build as [`build`] would run it, in a process whose
-    /// environment holds exactly `inherited`.
+    /// A host triple, for the tests below. Not this machine's: which branch a
+    /// test takes must not depend on where it runs.
+    const A_HOST: &str = "x86_64-unknown-linux-gnu";
+
+    /// The fixture build as [`build`] would run it for a suite built for the
+    /// host, in a process whose environment holds exactly `inherited`.
     fn fixture_build_inheriting(inherited: &[&str]) -> (Layout, Command) {
         let layout = scratch_layout("fixture-build");
-        let command = fixture_build(&layout, inherited.iter().copied().map(OsString::from));
+        let inherited = inherited.iter().copied().map(OsString::from);
+        let command = fixture_build(&layout, inherited, A_HOST, A_HOST);
         (layout, command)
     }
 
@@ -666,6 +715,35 @@ mod tests {
         assert_eq!(command.get_current_dir(), Some(layout.project.as_path()));
     }
 
+    /// A suite cross-compiled with `cargo test --target <triple>` has its
+    /// fixtures built for that triple. Nothing but the flag carries it: cargo
+    /// does not export `CARGO_BUILD_TARGET` to the test binary.
+    #[test]
+    fn a_suite_built_for_another_target_builds_its_fixtures_for_it() {
+        let layout = scratch_layout("fixture-build");
+        let command = fixture_build(&layout, std::iter::empty(), "thumbv7em-none-eabihf", A_HOST);
+        let arguments = arguments(&command);
+        let named: Vec<_> = arguments
+            .windows(2)
+            .filter(|pair| pair[0] == "--target")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(named, ["thumbv7em-none-eabihf"], "{arguments:?}");
+    }
+
+    /// A suite built for the host names no target. Naming even the host's would
+    /// move the scratch build's output under a triple component a diagnostic
+    /// can quote, and make every host golden specific to the machine that
+    /// blessed it.
+    #[test]
+    fn a_suite_built_for_the_host_names_no_target() {
+        let (_, command) = fixture_build_inheriting(&[]);
+        let arguments = arguments(&command);
+        assert!(
+            !arguments.iter().any(|argument| argument == "--target"),
+            "{arguments:?}"
+        );
+    }
     const OURS: &str = "/scratch/Cargo.toml";
 
     fn empty() -> Build {
