@@ -788,7 +788,7 @@ fn realign_gutters(lines: &mut [String]) {
         while end < rows.len() {
             match rows[end] {
                 Row::Gutter { allowed, .. } => cut = cut.min(allowed),
-                Row::Fixed | Row::Continuation => {}
+                Row::Fixed | Row::FixedContinuation | Row::Continuation => {}
                 Row::Heading | Row::Blank => break,
                 // A row this does not recognize could be one the gutter places,
                 // and moving everything around it would misalign the block. A
@@ -806,7 +806,11 @@ fn realign_gutters(lines: &mut [String]) {
                 match row {
                     Row::Gutter { from, .. } => shrink(line, *from, cut),
                     Row::Continuation => shrink(line, 0, cut),
-                    Row::Heading | Row::Fixed | Row::Blank | Row::Other => {}
+                    Row::Heading
+                    | Row::Fixed
+                    | Row::FixedContinuation
+                    | Row::Blank
+                    | Row::Other => {}
                 }
             }
         }
@@ -869,6 +873,13 @@ enum Row {
     /// sub-diagnostic's own `note:`/`help:` heading, which sits at column 0, and
     /// a bare `...`, which rustc prints flush left at any width.
     Fixed,
+    /// A line after the first of a message that a `Fixed` sub-diagnostic
+    /// heading carries over several lines. rustc indents it to the width of the
+    /// heading's own label -- six columns, for `note: ` and `help: ` alike --
+    /// so it is placed by the heading rather than by the gutter, and like the
+    /// heading it neither moves nor constrains the cut. Moving it with the
+    /// gutter would pull it out from under the heading it continues.
+    FixedContinuation,
     /// The second line of a `= note:` rustc split in two. It moves with the
     /// gutter but never constrains the cut: it is indented past the `= note:` it
     /// hangs off, and that note is a `Gutter` row in the same block already
@@ -883,23 +894,33 @@ enum Row {
     Other,
 }
 
-/// Classify every line, threading the state a `= note:` continuation needs.
+/// Classify every line, threading the state the two kinds of continuation need.
 fn classify(lines: &[String]) -> Vec<Row> {
     let mut rows = Vec::with_capacity(lines.len());
     // Leading spaces of the `= note:` row a wrapped second line would belong to.
     let mut wrapped: Option<usize> = None;
+    // Label width of the sub-diagnostic heading whose message a line indented
+    // at least that far would still be part of.
+    let mut labelled: Option<usize> = None;
     // Each rendered diagnostic cargo hands over ends in a blank line, so a blank
     // is what separates a `note:` opening one of its own from a `note:`
     // belonging to the error above it.
     let mut starts_message = true;
 
     for line in lines {
-        let row = row_of(line, wrapped, starts_message);
+        let row = row_of(line, wrapped, labelled, starts_message);
         starts_message = matches!(row, Row::Blank);
         wrapped = match row {
             // A wrap can itself be wrapped, so the anchor outlives one row.
             Row::Continuation => wrapped,
             Row::Gutter { .. } if is_attached_note(line) => Some(indent(line)),
+            _ => None,
+        };
+        labelled = match row {
+            // A message can run to any number of lines, all at the same indent.
+            Row::FixedContinuation => labelled,
+            // `None` for the other kind of `Fixed` row, a bare `...`.
+            Row::Fixed => sub_diagnostic_label(line),
             _ => None,
         };
         rows.push(row);
@@ -909,13 +930,31 @@ fn classify(lines: &[String]) -> Vec<Row> {
 }
 
 /// Classify one line. `wrapped` is the indent of the `= note:` above it, if the
-/// line before this one could be the first half of a split note, and
-/// `starts_message` is whether this line opens one of the rendered diagnostics
-/// cargo handed over rather than continuing the one before it.
-fn row_of(line: &str, wrapped: Option<usize>, starts_message: bool) -> Row {
+/// line before this one could be the first half of a split note; `labelled` is
+/// the label width of the sub-diagnostic heading above it, if the line before
+/// this one was that heading's message; and `starts_message` is whether this
+/// line opens one of the rendered diagnostics cargo handed over rather than
+/// continuing the one before it.
+fn row_of(
+    line: &str,
+    wrapped: Option<usize>,
+    labelled: Option<usize>,
+    starts_message: bool,
+) -> Row {
     // Lines are trimmed of trailing whitespace before they get here.
     if line.is_empty() {
-        return Row::Blank;
+        // A column-0 sub-diagnostic always has a span header after its
+        // message, so the blank that ends a rendered diagnostic cannot come
+        // here. What can is an empty line inside the message, which arrives
+        // as the label's indent and nothing else -- and read as `Blank` it
+        // would close the block halfway, cutting the rows above it and leaving
+        // the rest of the diagnostic at the old width. No rendering has shown
+        // one, so it disqualifies the block like any other row not understood.
+        return if labelled.is_some() {
+            Row::Other
+        } else {
+            Row::Blank
+        };
     }
 
     let before = indent(line);
@@ -971,7 +1010,7 @@ fn row_of(line: &str, wrapped: Option<usize>, starts_message: bool) -> Row {
         // one would split a diagnostic that shares a gutter into halves cut by
         // different amounts, which is the one way this can misalign rather than
         // merely under-cut.
-        if line.starts_with("note:") || line.starts_with("help:") {
+        if sub_diagnostic_label(line).is_some() {
             return if starts_message {
                 Row::Heading
             } else {
@@ -981,12 +1020,34 @@ fn row_of(line: &str, wrapped: Option<usize>, starts_message: bool) -> Row {
         return Row::Other;
     }
 
+    // The rest of a sub-diagnostic heading's message. rustc prefixes every line
+    // after the first with exactly the label's width and then prints the line
+    // as written, so a line of the message that has leading spaces of its own
+    // sits further in, never shallower. The gutter rows that follow the message
+    // are all recognized above, before this can claim them.
+    if labelled.is_some_and(|width| before >= width) {
+        return Row::FixedContinuation;
+    }
+
     // Indented past the `= note:` above it: the second line rustc splits an
     // `expected`/`found` pair onto.
     match wrapped {
         Some(anchor) if before > anchor => Row::Continuation,
         _ => Row::Other,
     }
+}
+
+/// The width of the label a column-0 `note:` or `help:` opens with, if the line
+/// is one: the level and the `: ` after it, which is how far rustc indents the
+/// rest of the message.
+fn sub_diagnostic_label(line: &str) -> Option<usize> {
+    ["note", "help"]
+        .iter()
+        .find(|level| {
+            line.strip_prefix(**level)
+                .is_some_and(|rest| rest.starts_with(':'))
+        })
+        .map(|level| level.len() + ": ".len())
 }
 
 /// Whether what follows a row's number and padding is a gutter marker.
@@ -2014,6 +2075,128 @@ mod tests {
                 "  |\n",
                 "4 | fn main() { split::<3>(); }\n",
                 "  |             ^^^^^^^^^^^^\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_sub_diagnostic_message_over_two_lines_still_re_aligns() {
+        // rustc 1.98's rendering of `collect::<Vec<u16>>()` over an iterator of
+        // `u8`, with `rust-src` installed and only the paths changed. The
+        // `help:` carries its message over two lines, the second indented to
+        // the width of `help: `. Read as a row nothing recognized, it left the
+        // whole diagnostic four columns wide -- the width of the standard
+        // library's line numbers, both blanked.
+        let rendered = concat!(
+            "error[E0277]: a value of type `Vec<u16>` cannot be built from an iterator over elements of type `u8`\n",
+            "    --> src/bin/f_a.rs:3:50\n",
+            "     |\n",
+            "   3 |     let _ = v.iter().map(|x| x + 1u16).collect::<Vec<u16>>();\n",
+            "     |                                        -------   ^^^^^^^^ value of type `Vec<u16>` cannot be built from `std::iter::Iterator<Item=u8>`\n",
+            "     |                                        |\n",
+            "     |                                        required by a bound introduced by this call\n",
+            "     |\n",
+            "help: the trait `FromIterator<u8>` is not implemented for `Vec<u16>`\n",
+            "      but trait `FromIterator<u16>` is implemented for it\n",
+            "    --> /home/u/.rustup/toolchains/stable/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:3938:1\n",
+            "     |\n",
+            "3938 | impl<T> FromIterator<T> for Vec<T> {\n",
+            "     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+            "     = help: for that trait implementation, expected `u16`, found `u8`\n",
+            "note: the method call chain might not have had the expected associated types\n",
+            "    --> src/bin/f_a.rs:3:22\n",
+            "     |\n",
+            "   2 |     let v: Vec<u8> = Vec::new();\n",
+            "     |                      ---------- this expression has type `Vec<u8>`\n",
+            "   3 |     let _ = v.iter().map(|x| x + 1u16).collect::<Vec<u16>>();\n",
+            "     |               ------ ^^^^^^^^^^^^^^^^^ `Iterator::Item` changed to `u8` here\n",
+            "     |               |\n",
+            "     |               `Iterator::Item` is `&u8` here\n",
+            "note: required by a bound in `collect`\n",
+            "    --> /home/u/.rustup/toolchains/stable/lib/rustlib/src/rust/library/core/src/iter/traits/iterator.rs:2077:19\n",
+            "     |\n",
+            "2077 |     fn collect<B: FromIterator<Self::Item>>(self) -> B\n",
+            "     |                   ^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Iterator::collect`\n",
+        );
+        let once = normalizer().normalize(rendered, "tests/ui/a.rs");
+        assert_eq!(
+            once,
+            concat!(
+                "error[E0277]: a value of type `Vec<u16>` cannot be built from an iterator over elements of type `u8`\n",
+                " --> tests/ui/a.rs:3:50\n",
+                "  |\n",
+                "3 |     let _ = v.iter().map(|x| x + 1u16).collect::<Vec<u16>>();\n",
+                "  |                                        -------   ^^^^^^^^ value of type `Vec<u16>` cannot be built from `std::iter::Iterator<Item=u8>`\n",
+                "  |                                        |\n",
+                "  |                                        required by a bound introduced by this call\n",
+                "  |\n",
+                "help: the trait `FromIterator<u8>` is not implemented for `Vec<u16>`\n",
+                // Where rustc put it: under the heading it continues, which the
+                // gutter never moves.
+                "      but trait `FromIterator<u16>` is implemented for it\n",
+                " --> $RUST/alloc/src/vec/mod.rs\n",
+                "  |\n",
+                "  | impl<T> FromIterator<T> for Vec<T> {\n",
+                "  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n",
+                "  = help: for that trait implementation, expected `u16`, found `u8`\n",
+                "note: the method call chain might not have had the expected associated types\n",
+                " --> tests/ui/a.rs:3:22\n",
+                "  |\n",
+                "2 |     let v: Vec<u8> = Vec::new();\n",
+                "  |                      ---------- this expression has type `Vec<u8>`\n",
+                "3 |     let _ = v.iter().map(|x| x + 1u16).collect::<Vec<u16>>();\n",
+                "  |               ------ ^^^^^^^^^^^^^^^^^ `Iterator::Item` changed to `u8` here\n",
+                "  |               |\n",
+                "  |               `Iterator::Item` is `&u8` here\n",
+                "note: required by a bound in `collect`\n",
+                " --> $RUST/core/src/iter/traits/iterator.rs\n",
+                "  |\n",
+                "  |     fn collect<B: FromIterator<Self::Item>>(self) -> B\n",
+                "  |                   ^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Iterator::collect`\n",
+            )
+        );
+        assert_eq!(
+            once,
+            normalizer().normalize(&once, "tests/ui/a.rs"),
+            "normalizing twice must not differ from normalizing once"
+        );
+    }
+
+    #[test]
+    fn an_empty_line_inside_a_sub_diagnostic_message_leaves_its_diagnostic_alone() {
+        // rustc has not been seen to print this shape. It is here because read
+        // as the blank that ends a diagnostic, the empty line would close the
+        // block halfway: the rows above it cut, the rest left at the old width.
+        let n = with_deps(&[("/elsewhere/core", "core")]);
+        let rendered = concat!(
+            "error[E0277]: the trait bound is not satisfied\n",
+            "    --> src/bin/f_a.rs:2:15\n",
+            "     |\n",
+            "   2 |     take(Widget);\n",
+            "     |          ^^^^^^\n",
+            "help: first line\n",
+            "\n",
+            "      third line\n",
+            "    --> /elsewhere/core/src/lib.rs:1202:16\n",
+            "     |\n",
+            "1202 | pub fn take<T: Sealed>(_t: T) {}\n",
+            "     |                ^^^^^^\n",
+        );
+        assert_eq!(
+            n.normalize(rendered, "tests/ui/a.rs"),
+            concat!(
+                "error[E0277]: the trait bound is not satisfied\n",
+                "    --> tests/ui/a.rs:2:15\n",
+                "     |\n",
+                "   2 |     take(Widget);\n",
+                "     |          ^^^^^^\n",
+                "help: first line\n",
+                "\n",
+                "      third line\n",
+                "    --> $CORE/src/lib.rs\n",
+                "     |\n",
+                "     | pub fn take<T: Sealed>(_t: T) {}\n",
+                "     |                ^^^^^^\n",
             )
         );
     }
