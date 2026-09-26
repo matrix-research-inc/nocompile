@@ -14,8 +14,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
-use std::fs::File;
-use std::io;
+use std::fs::{File, TryLockError};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -432,9 +432,41 @@ pub(crate) fn host_lockfile(manifest_dir: &Path) -> io::Result<Option<PathBuf>> 
 /// is dropped. It is taken on a file rather than an in-process mutex because the
 /// same hazard exists across processes -- `cargo nextest` runs test binaries
 /// concurrently, and nothing stops two `cargo test` invocations at once.
+///
+/// A run that has to wait says so, once, on stderr. See [`lock_reporting_waits`].
 pub(crate) fn lock(layout: &Layout) -> io::Result<File> {
+    // `io::stderr()` rather than `eprintln!`: libtest captures what the `print`
+    // family of macros writes from inside a test, and shows it only after the
+    // test has finished, and only if it failed -- too late, and usually never,
+    // for someone wondering why a run is not moving. A write to the handle
+    // itself goes straight to the process's stderr, where they can see it.
+    lock_reporting_waits(layout, &mut io::stderr())
+}
+
+/// [`lock`], writing the line that says a run is waiting to `notice`.
+///
+/// The wait itself is correct, and deliberately unbounded: a run that gave up
+/// would have to fail, and a run behind a slow one is not failing. But a silent
+/// wait is indistinguishable from a slow fixture build, or a hang, so a run that
+/// is about to block says so first, naming the file it is waiting on. The lock
+/// is tried before anything is written, so an uncontended run stays quiet.
+fn lock_reporting_waits(layout: &Layout, notice: &mut impl Write) -> io::Result<File> {
     std::fs::create_dir_all(&layout.root)?;
-    let file = File::create(layout.root.join(".lock"))?;
+    let path = layout.root.join(".lock");
+    let file = File::create(&path)?;
+    match file.try_lock() {
+        Ok(()) => return Ok(file),
+        Err(TryLockError::WouldBlock) => {}
+        Err(TryLockError::Error(error)) => return Err(error),
+    }
+    // Deliberately not propagated. The notice is a courtesy to whoever is
+    // watching, and a stderr that cannot be written to is no reason to fail a
+    // run that can otherwise go ahead.
+    let _ = writeln!(
+        notice,
+        "nocompile: waiting for another nocompile run to finish (lock file: {})",
+        path.display()
+    );
     file.lock()?;
     Ok(file)
 }
@@ -687,6 +719,79 @@ mod tests {
         let manifest = dir.join("Cargo.toml");
         std::fs::write(&manifest, "[package]\n").expect("write the scratch manifest");
         manifest
+    }
+
+    /// A layout of its own under the target directory, named per test for the
+    /// same reason as [`scratch_manifest`].
+    fn scratch_layout(name: &str) -> Layout {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("nocompile-unittest")
+            .join(name);
+        Layout {
+            project: root.join("project"),
+            target: root.join("target"),
+            root,
+        }
+    }
+
+    /// Hands each write to the test as it happens, so a test can wait for the
+    /// notice to appear rather than guess how long it takes.
+    struct Relay(std::sync::mpsc::Sender<Vec<u8>>);
+
+    impl Write for Relay {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .send(bytes.to_vec())
+                .map_err(|_| io::Error::other("the test stopped listening"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A run that has to wait for the lock says so, naming the lock file, and
+    /// then waits rather than giving up. One that does not have to wait says
+    /// nothing: the notice is for a wait someone might otherwise mistake for a
+    /// hang, not for every run.
+    #[test]
+    fn a_run_that_waits_for_the_lock_says_so_and_then_takes_it() {
+        let layout = scratch_layout("lock-wait");
+        let mut quiet = Vec::new();
+        let held = lock_reporting_waits(&layout, &mut quiet).expect("an uncontended lock");
+        assert!(quiet.is_empty(), "{}", String::from_utf8_lossy(&quiet));
+
+        let (sender, notices) = std::sync::mpsc::channel();
+        let waiter = {
+            let layout = layout.clone();
+            std::thread::spawn(move || lock_reporting_waits(&layout, &mut Relay(sender)))
+        };
+        // Waits for the waiter to start its notice, so the lock is released
+        // only once it is known to have been contended. The timeout is not a
+        // measurement: it is what turns a waiter that blocks *without* a notice
+        // into a failure instead of a test that never ends, since the lock it is
+        // blocked on is released only after this returns.
+        let first = notices.recv_timeout(std::time::Duration::from_secs(60));
+        drop(held);
+        waiter
+            .join()
+            .expect("the waiting thread panicked")
+            .expect("the lock is taken once the first run releases it");
+        let first = first.expect("the second run did not say it was waiting for the lock");
+
+        let notice: Vec<u8> = first
+            .into_iter()
+            .chain(notices.into_iter().flatten())
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&notice),
+            format!(
+                "nocompile: waiting for another nocompile run to finish (lock file: {})\n",
+                layout.root.join(".lock").display()
+            )
+        );
     }
 
     /// Attribution compares manifest paths textually, so two spellings of one
