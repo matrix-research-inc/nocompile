@@ -1600,6 +1600,51 @@ fn a_dependency_that_does_not_build_is_reported_once_with_its_own_error() {
     );
 }
 
+/// Cargo forwards whatever a proc macro prints to stdout into the stream of JSON
+/// messages the harness reads, and a derive author debugging a map prints one
+/// that opens with a brace and is not JSON. That is the macro's business, not
+/// the run's: every fixture must still be judged, and the fixture's own
+/// diagnostics must still reach its golden.
+#[test]
+fn a_proc_macros_debug_print_of_a_map_does_not_fail_the_run() {
+    let sandbox = Sandbox::new("proc-macro-debug-print");
+    sandbox.write(
+        "noisy/Cargo.toml",
+        "[package]\nname = \"noisy\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n\n[dependencies]\n",
+    );
+    // `{1: "a"}` on a line of its own: a brace first, and not JSON after it.
+    sandbox.write(
+        "noisy/src/lib.rs",
+        "extern crate proc_macro;\n\
+         use proc_macro::TokenStream;\n\n\
+         #[proc_macro_attribute]\n\
+         pub fn noisy(_: TokenStream, item: TokenStream) -> TokenStream {\n    \
+         let map = std::collections::BTreeMap::from([(1, \"a\")]);\n    \
+         println!(\"{map:?}\");\n    \
+         item\n\
+         }\n",
+    );
+    sandbox.write(
+        "ui/rejected.rs",
+        "#[noisy::noisy]\nfn main() {\n    let _x: u8 = \"not a u8\";\n}\n",
+    );
+
+    let mut t = sandbox.cases();
+    t.dependency_path("noisy", "noisy");
+    t.compile_fail("ui/rejected.rs");
+
+    assert_passed(&t.overwrite(true).run());
+    let golden = sandbox.read("ui/rejected.stderr");
+    assert!(
+        golden.contains("error[E0308]: mismatched types"),
+        "{golden}"
+    );
+    assert!(
+        !golden.contains("{1: \"a\"}"),
+        "the macro's stdout reached the golden:\n{golden}"
+    );
+}
+
 /// A fixture with no `fn main` is a documented case, and rustc reports it by
 /// naming the *crate* rather than a span in it. The crate is a bin target this
 /// harness generated, so its name must not reach the golden: nobody reading the

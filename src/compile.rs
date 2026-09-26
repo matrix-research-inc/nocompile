@@ -14,10 +14,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
-use std::fs::File;
-use std::io;
+use std::fs::{File, TryLockError};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Condvar, Mutex, PoisonError};
 
 use crate::json;
 use crate::scratch::Layout;
@@ -148,6 +149,43 @@ fn profile_keys(keys: impl Iterator<Item = OsString>) -> Vec<OsString> {
 
 /// Build every bin target of the scratch project in one invocation.
 pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
+    let inherited = env::vars_os().map(|(key, _)| key);
+    let output = fixture_build(layout, inherited, TARGET).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut build = Build {
+        messages: HashMap::new(),
+        compiled: HashSet::new(),
+        foreign: Vec::new(),
+        other_manifests: BTreeSet::new(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        started: false,
+    };
+
+    ingest(&mut build, &stdout, &layout.manifest())?;
+    Ok(build)
+}
+
+/// The `cargo build` that compiles every fixture, ready to run.
+///
+/// Separate from [`build`] so that what the child is handed can be inspected
+/// without running it. The environment sweep below is a guarantee the README
+/// makes, and no fixture's outcome notices it missing on a machine whose shell
+/// sets none of the variables it removes, which is the usual one. So it is
+/// tested where it lives, on the `Command`.
+///
+/// `inherited` names the variables the child would otherwise inherit, which in
+/// [`build`] is this process's own. It is a parameter so that a test can supply
+/// an environment without `env::set_var`, which is `unsafe` in edition 2024 and
+/// would race every other test reading the environment.
+///
+/// `target` is the triple the fixtures are built for, which in [`build`] is
+/// [`TARGET`]. It is a parameter so that a test can check the triple is passed
+/// through as given, rather than one that happens to be this machine's.
+fn fixture_build(
+    layout: &Layout,
+    inherited: impl Iterator<Item = OsString>,
+    target: &str,
+) -> Command {
     let mut command = Command::new(cargo());
 
     command
@@ -181,6 +219,29 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
         .arg(layout.manifest())
         .current_dir(&layout.project);
 
+    // The fixtures are built for exactly the target the suite was, which is what
+    // lets a crate test invariants about its own target. Nothing at run time
+    // says what that was: `cargo test --target <triple>` does not export
+    // `CARGO_BUILD_TARGET` to the test binary. So the triple is captured when
+    // this crate is compiled (see `TARGET`) and named here -- always, the host's
+    // included. Leaving the host's unnamed would hand the choice back to cargo's
+    // own resolution, where a `[build] target` in a discovered
+    // `.cargo/config.toml` wins: an embedded crate that sets one and runs its
+    // suite with `--target <host>` would have its fixtures built for the board
+    // rather than for the suite. Named, the flag outranks that and the variable
+    // alike, and the rule is simply the suite's target.
+    //
+    // Naming a target moves cargo's output under a component for it
+    // (`$SCRATCH/target/<triple>/debug/...`). That is not visible in a golden
+    // in practice: a path under there also runs through one of cargo's hashed
+    // directories, which move with the toolchain and the dependency graph, so
+    // no golden meant to hold across machines could quote one anyway.
+    // `trybuild` names the target always too, and offers an opt-out for a
+    // reason about flags: it forwards `RUSTFLAGS`, which cargo applies to host
+    // artifacts only when no target is named. This harness clears `RUSTFLAGS`,
+    // so the reason does not arise.
+    command.arg("--target").arg(target);
+
     // An inherited `-D warnings` turns every fixture's warnings into errors and
     // silently changes what the goldens contain.
     //
@@ -191,6 +252,7 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
     // `CARGO_ENCODED_RUSTFLAGS` to the empty string is what actually overrides
     // that: it sits at the top of cargo's precedence order and an empty value
     // means "no flags" rather than "unset".
+    //
     // The scratch project's profile is this harness's to choose, the same as its
     // manifest is. Cargo reads `CARGO_PROFILE_<profile>_<key>` from the
     // environment, so an inherited `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false`
@@ -207,19 +269,25 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
     // above because `-D warnings` is about diagnostics themselves, which is the
     // one thing a golden is made of.
     //
-    // `CARGO_BUILD_TARGET` is deliberately not swept with them, though it
-    // reaches the goldens just as directly. It is not an incidental build knob:
-    // it says what platform the crate is for, and it is also what the test
-    // binary running this was built for, so following it is what keeps a fixture
-    // compiling the way the crate under test does. A `no_std` crate's
-    // compile-fail invariants are usually about its target -- a const guard
-    // asserting a 64-bit pointer can only be tested by building for a target
-    // that has one -- and forcing the host would quietly stop testing it.
-    // `trybuild` follows the same triple, by passing `--target` for the one it
-    // was itself compiled for.
+    // `CARGO_BUILD_TARGET` needs no sweep, though it would reach the goldens
+    // just as directly: `--target` above outranks it, as it does a `[build]
+    // target` in a discovered config, so neither can move the fixtures off the
+    // suite's target.
+    //
+    // The sweep stops at what the toolchain *is*. `RUSTC_BOOTSTRAP` and
+    // `CARGO_UNSTABLE_*` are left alone, as `RUSTUP_TOOLCHAIN` is: they
+    // decide which compiler and which cargo features exist, not how this build
+    // uses them, and a crate that needs them to build at all -- `-Zbuild-std`
+    // for a target with no prebuilt standard library, say -- would find its
+    // fixtures unable to. So are the rustc wrappers (`RUSTC_WRAPPER`,
+    // `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`): a wrapper such as
+    // `sccache` is transparent by contract, and sweeping it would buy nothing
+    // but a cold cache on every run. A shell that sets any of these gets goldens
+    // that depend on it, the same way it gets goldens that depend on the
+    // toolchain it selects.
     //
     // Before the two set below, which the sweep would otherwise take with it.
-    for key in profile_keys(env::vars_os().map(|(key, _)| key)) {
+    for key in profile_keys(inherited) {
         command.env_remove(key);
     }
 
@@ -246,24 +314,17 @@ pub(crate) fn build(layout: &Layout) -> io::Result<Build> {
         // has not changed, and within one fixture there is nothing to reuse.
         .env("CARGO_INCREMENTAL", "0");
 
-    let output = command.output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let mut build = Build {
-        messages: HashMap::new(),
-        compiled: HashSet::new(),
-        foreign: Vec::new(),
-        other_manifests: BTreeSet::new(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        started: false,
-    };
-
-    ingest(&mut build, &stdout, &layout.manifest())?;
-    Ok(build)
+    command
 }
 
-/// How a cargo message opens. Cargo puts `reason` first in every one it emits,
-/// and this is only used to find a message that is *not* at the start of its
-/// line, so a false negative costs nothing that was not already lost.
+/// How a cargo message opens. Cargo puts `reason` first in every one it emits.
+///
+/// This, rather than a leading brace, is what marks a line as cargo's own.
+/// Anything else a line can start with -- a proc macro's `{1: "a"}` included --
+/// is forwarded output. A false negative is also loud rather than quiet: if
+/// cargo ever stopped putting `reason` first, no message would be read,
+/// `build-finished` among them, and the run would fail as one cargo never
+/// started rather than produce short goldens.
 const MESSAGE_OPENING: &str = r#"{"reason":"#;
 
 /// Sort one invocation's stdout into `build`.
@@ -272,7 +333,10 @@ fn ingest(build: &mut Build, stdout: &str, manifest: &Path) -> io::Result<()> {
         // Cargo forwards anything the compiler or a proc macro writes to stdout
         // into this stream verbatim. A `println!` while debugging a derive is
         // routine, and it is not cargo's JSON: skip it rather than fail the run
-        // over output that has nothing to do with the fixtures.
+        // over output that has nothing to do with the fixtures. That holds for
+        // output that opens with a brace, too: a derive printing a map with
+        // `{:?}` writes `{1: "a"}`, so a line is taken for cargo's only when it
+        // opens the way cargo's messages do.
         //
         // Skipping a whole line is only safe while cargo's own messages stay on
         // lines of their own, and cargo does not document that. Checked against
@@ -286,7 +350,7 @@ fn ingest(build: &mut Build, stdout: &str, manifest: &Path) -> io::Result<()> {
         // looked like a message, and it is skipped as any other line would be.
         // Guessing no further than "this parses as a whole cargo message" is
         // what keeps a proc macro's debug print from failing the run.
-        if !line.starts_with('{') {
+        if !line.starts_with(MESSAGE_OPENING) {
             let recovered = line
                 .find(MESSAGE_OPENING)
                 .and_then(|at| json::parse(&line[at..]).ok());
@@ -380,6 +444,14 @@ fn cargo() -> std::ffi::OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
 }
 
+/// The target triple this crate was compiled for.
+///
+/// Which is the triple the suite was compiled for, since this crate is linked
+/// into the test binary. Captured by `build.rs` because a build script is the
+/// only place cargo says what the target is: the test binary is told nothing,
+/// and `cfg` exposes a triple's parts but not the triple.
+const TARGET: &str = env!("NOCOMPILE_TARGET");
+
 /// The lockfile of the workspace the host crate belongs to, if it has one.
 ///
 /// The scratch project is a workspace of its own (hazard 2 in `scratch`), so
@@ -420,13 +492,128 @@ pub(crate) fn host_lockfile(manifest_dir: &Path) -> io::Result<Option<PathBuf>> 
 /// functions each calling `nocompile::cases!()` hit it every time, and the
 /// symptom is a broken fixture reported as passing.
 ///
-/// The lock is held for the whole of a run and released when the returned file
-/// is dropped. It is taken on a file rather than an in-process mutex because the
-/// same hazard exists across processes -- `cargo nextest` runs test binaries
-/// concurrently, and nothing stops two `cargo test` invocations at once.
-pub(crate) fn lock(layout: &Layout) -> io::Result<File> {
+/// The lock is held for the whole of a run and released when the returned
+/// guard is dropped. It has two levels, taken in order. Runs in this process
+/// queue on an in-process claim on the scratch root first, silently: a
+/// `#[test]` function waiting on its sibling is ordinary, and the test runner
+/// already shows that tests are running. Only then is the file lock taken,
+/// which is what covers the same hazard across processes -- `cargo nextest`
+/// runs test binaries concurrently, and nothing stops two `cargo test`
+/// invocations at once. Since this process's own runs never reach the file lock
+/// together, a wait there is always on another process, which is the wait
+/// nothing else would explain, and it says so once on stderr. See
+/// [`lock_file_reporting_waits`].
+///
+/// The claim is per scratch root rather than one for the whole process: runs
+/// for different host packages share no scratch project, and serializing them
+/// would cost their parallelism for nothing.
+pub(crate) fn lock(layout: &Layout) -> io::Result<ScratchLock> {
+    // `io::stderr()` rather than `eprintln!`: libtest captures what the `print`
+    // family of macros writes from inside a test, and shows it only after the
+    // test has finished, and only if it failed -- too late, and usually never,
+    // for someone wondering why a run is not moving. A write to the handle
+    // itself goes straight to the process's stderr, where they can see it.
+    lock_reporting_waits(layout, &mut io::stderr())
+}
+
+/// [`lock`], writing the notice of a wait on another process to `notice`.
+fn lock_reporting_waits(layout: &Layout, notice: &mut impl Write) -> io::Result<ScratchLock> {
+    let claim = RootClaim::acquire(&layout.root);
+    let file = lock_file_reporting_waits(layout, notice)?;
+    Ok(ScratchLock {
+        file,
+        _claim: claim,
+    })
+}
+
+/// A run's hold on its scratch project. See [`lock`].
+pub(crate) struct ScratchLock {
+    file: File,
+    _claim: RootClaim,
+}
+
+impl Drop for ScratchLock {
+    /// Releases the file lock before the in-process claim, which is dropped
+    /// after this returns. The other order would let the next run in this
+    /// process find the file still locked, and announce a wait on another
+    /// process that does not exist.
+    fn drop(&mut self) {
+        // Closing the file releases the lock too, when the field is dropped just
+        // after this, so a failure here costs at most that spurious notice. It
+        // is explicit because Windows does not promise that closing a handle
+        // releases its locks promptly.
+        let _ = self.file.unlock();
+    }
+}
+
+/// The scratch roots a run in this process currently holds.
+static CLAIMED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// Signalled whenever a root is released from [`CLAIMED`].
+static RELEASED: Condvar = Condvar::new();
+
+/// This process's claim on one scratch root, released when dropped.
+///
+/// The set it lives in is only ever changed by a single `insert` or `remove`,
+/// so a panic on another thread cannot leave it half-updated, and a poisoned
+/// lock is recovered rather than propagated: poisoning here would otherwise
+/// turn one failing test into every later run in the process failing too.
+struct RootClaim {
+    root: PathBuf,
+}
+
+impl RootClaim {
+    fn acquire(root: &Path) -> Self {
+        let mut claimed = CLAIMED.lock().unwrap_or_else(PoisonError::into_inner);
+        while claimed.contains(root) {
+            claimed = RELEASED
+                .wait(claimed)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        claimed.insert(root.to_path_buf());
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for RootClaim {
+    fn drop(&mut self) {
+        CLAIMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.root);
+        // Every waiter rechecks its own root, so waking all of them is what
+        // lets the one for this root through, whichever it is.
+        RELEASED.notify_all();
+    }
+}
+
+/// The file level of [`lock`], writing the line that says a run is waiting to
+/// `notice`.
+///
+/// The wait itself is correct, and deliberately unbounded: a run that gave up
+/// would have to fail, and a run behind a slow one is not failing. But a silent
+/// wait is indistinguishable from a slow fixture build, or a hang, so a run that
+/// is about to block says so first, naming the file it is waiting on. The lock
+/// is tried before anything is written, so an uncontended run stays quiet.
+fn lock_file_reporting_waits(layout: &Layout, notice: &mut impl Write) -> io::Result<File> {
     std::fs::create_dir_all(&layout.root)?;
-    let file = File::create(layout.root.join(".lock"))?;
+    let path = layout.root.join(".lock");
+    let file = File::create(&path)?;
+    match file.try_lock() {
+        Ok(()) => return Ok(file),
+        Err(TryLockError::WouldBlock) => {}
+        Err(TryLockError::Error(error)) => return Err(error),
+    }
+    // Deliberately not propagated. The notice is a courtesy to whoever is
+    // watching, and a stderr that cannot be written to is no reason to fail a
+    // run that can otherwise go ahead.
+    let _ = writeln!(
+        notice,
+        "nocompile: waiting for another nocompile run to finish (lock file: {})",
+        path.display()
+    );
     file.lock()?;
     Ok(file)
 }
@@ -447,6 +634,8 @@ pub(crate) fn write_if_changed(path: &Path, contents: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn keys(names: &[&str]) -> Vec<String> {
@@ -478,12 +667,11 @@ mod tests {
 
     #[test]
     fn variables_that_are_not_profile_settings_are_left_alone() {
-        // `RUSTC`, `RUSTUP_TOOLCHAIN` and `CARGO_BUILD_TARGET` in particular:
-        // the fixtures must be built by the same compiler, for the same target,
-        // as the crate under test, so what identifies those is exactly the part
-        // of the environment to keep. Sweeping the target would compile a
-        // `no_std` crate's fixtures for the host and quietly stop testing the
-        // invariant they exist for.
+        // `RUSTC` and `RUSTUP_TOOLCHAIN` in particular: the fixtures must be
+        // built by the same compiler as the crate under test, so what identifies
+        // it is exactly the part of the environment to keep. `CARGO_BUILD_TARGET`
+        // is kept too, but only because it cannot matter: the suite's target is
+        // named as `--target`, which outranks it, tested below.
         assert!(
             keys(&[
                 "CARGO",
@@ -497,6 +685,162 @@ mod tests {
             ])
             .is_empty()
         );
+    }
+
+    /// The triple the tests below build for. Not this machine's, so that what
+    /// they see passed through is the triple they gave rather than a
+    /// coincidence.
+    const A_TARGET: &str = "thumbv7em-none-eabihf";
+
+    /// The fixture build as [`build`] would run it, in a process whose
+    /// environment holds exactly `inherited`.
+    fn fixture_build_inheriting(inherited: &[&str]) -> (Layout, Command) {
+        let layout = scratch_layout("fixture-build");
+        let inherited = inherited.iter().copied().map(OsString::from);
+        let command = fixture_build(&layout, inherited, A_TARGET);
+        (layout, command)
+    }
+
+    /// Every change the command makes to the environment it inherits: `None`
+    /// for a variable removed, `Some` for one set. A variable it leaves alone is
+    /// absent, and so passes through as whatever the shell had.
+    fn environment(command: &Command) -> BTreeMap<String, Option<String>> {
+        command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    fn arguments(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The sweep, checked where it takes effect rather than in the list of names
+    /// it is computed from. Asserted whole: a variable this starts setting or
+    /// removing is a change to what the goldens depend on, and should have to
+    /// say so here.
+    #[test]
+    fn the_fixture_build_clears_every_inherited_flag_and_profile_key() {
+        let (_, command) = fixture_build_inheriting(&[
+            "PATH",
+            "RUSTFLAGS",
+            "CARGO_BUILD_RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_TARGET_DIR",
+            "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS",
+            "CARGO_PROFILE_DEV_OPT_LEVEL",
+            "CARGO_PROFILE_RELEASE_PANIC",
+            // Both inherited and set by the harness. The harness's setting is the
+            // one that must survive, which it does only if the sweep runs first.
+            "CARGO_PROFILE_DEV_DEBUG",
+            "CARGO_INCREMENTAL",
+        ]);
+
+        let removed = None;
+        let set = |value: &str| Some(value.to_string());
+        let expected = BTreeMap::from([
+            ("RUSTFLAGS".to_string(), removed.clone()),
+            ("CARGO_BUILD_RUSTFLAGS".to_string(), removed.clone()),
+            // Empty rather than removed: that is what overrides a discovered
+            // `[build] rustflags`.
+            ("CARGO_ENCODED_RUSTFLAGS".to_string(), set("")),
+            ("CARGO_TARGET_DIR".to_string(), removed.clone()),
+            (
+                "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS".to_string(),
+                removed.clone(),
+            ),
+            ("CARGO_PROFILE_DEV_OPT_LEVEL".to_string(), removed.clone()),
+            ("CARGO_PROFILE_RELEASE_PANIC".to_string(), removed.clone()),
+            ("CARGO_PROFILE_DEV_DEBUG".to_string(), set("none")),
+            ("CARGO_INCREMENTAL".to_string(), set("0")),
+        ]);
+        assert_eq!(environment(&command), expected);
+    }
+
+    /// The flags and variables a user's shell is most likely to carry are
+    /// cleared whether or not the harness saw them, so the guarantee does not
+    /// rest on the environment it was handed being complete.
+    #[test]
+    fn the_fixture_build_clears_flags_it_was_not_told_about() {
+        let (_, command) = fixture_build_inheriting(&[]);
+        let environment = environment(&command);
+        for key in ["RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "CARGO_TARGET_DIR"] {
+            assert_eq!(environment.get(key), Some(&None), "{key}");
+        }
+        assert_eq!(
+            environment.get("CARGO_ENCODED_RUSTFLAGS"),
+            Some(&Some(String::new()))
+        );
+    }
+
+    /// The other side of the sweep's boundary: what selects the compiler, the
+    /// target, and the features they have is inherited untouched, so that the
+    /// fixtures build with the toolchain the crate under test does.
+    #[test]
+    fn the_fixture_build_leaves_the_toolchain_to_inherit() {
+        const TOOLCHAIN: [&str; 8] = [
+            "RUSTC",
+            "RUSTUP_TOOLCHAIN",
+            "CARGO_BUILD_TARGET",
+            "RUSTC_BOOTSTRAP",
+            "CARGO_UNSTABLE_BUILD_STD",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+        ];
+        let (_, command) = fixture_build_inheriting(&TOOLCHAIN);
+        let environment = environment(&command);
+        for key in TOOLCHAIN {
+            assert_eq!(environment.get(key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn the_fixture_build_compiles_every_fixture_into_the_scratch_target_dir() {
+        let (layout, command) = fixture_build_inheriting(&[]);
+        let manifest = layout.manifest();
+        let expected = [
+            "build",
+            "--bins",
+            "--keep-going",
+            "--message-format=json",
+            "--quiet",
+            "--color=never",
+            "--offline",
+            "--target-dir",
+            &layout.target.to_string_lossy(),
+            "--manifest-path",
+            &manifest.to_string_lossy(),
+            "--target",
+            A_TARGET,
+        ];
+        assert_eq!(arguments(&command), expected);
+        assert_eq!(command.get_current_dir(), Some(layout.project.as_path()));
+    }
+
+    /// The fixtures are built for exactly the suite's target, named once and
+    /// always. Nothing but the flag carries it -- cargo does not export
+    /// `CARGO_BUILD_TARGET` to the test binary -- and nothing but the flag
+    /// outranks a `[build] target` the scratch build would otherwise pick up
+    /// from a discovered config.
+    #[test]
+    fn the_fixtures_are_built_for_the_suites_target() {
+        let (_, command) = fixture_build_inheriting(&["CARGO_BUILD_TARGET"]);
+        let arguments = arguments(&command);
+        let named: Vec<_> = arguments
+            .windows(2)
+            .filter(|pair| pair[0] == "--target")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(named, [A_TARGET], "{arguments:?}");
     }
 
     const OURS: &str = "/scratch/Cargo.toml";
@@ -681,6 +1025,139 @@ mod tests {
         manifest
     }
 
+    /// A layout of its own under the target directory, named per test for the
+    /// same reason as [`scratch_manifest`].
+    fn scratch_layout(name: &str) -> Layout {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("nocompile-unittest")
+            .join(name);
+        Layout {
+            project: root.join("project"),
+            target: root.join("target"),
+            root,
+        }
+    }
+
+    /// Hands each write to the test as it happens, so a test can wait for the
+    /// notice to appear rather than guess how long it takes.
+    struct Relay(std::sync::mpsc::Sender<Vec<u8>>);
+
+    impl Write for Relay {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .send(bytes.to_vec())
+                .map_err(|_| io::Error::other("the test stopped listening"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A run that has to wait on another process for the lock says so, naming
+    /// the lock file, and then waits rather than giving up. One that does not
+    /// have to wait says nothing: the notice is for a wait someone might
+    /// otherwise mistake for a hang, not for every run.
+    ///
+    /// The other process is played by a second handle on the lock file, which
+    /// contends exactly as one in another process would -- file locks belong to
+    /// the open file, not the process -- and which bypasses the in-process
+    /// claim, as another process's run does.
+    #[test]
+    fn a_run_that_waits_on_another_process_says_so_and_then_takes_it() {
+        let layout = scratch_layout("lock-wait");
+        let mut quiet = Vec::new();
+        drop(lock_reporting_waits(&layout, &mut quiet).expect("an uncontended lock"));
+        assert!(quiet.is_empty(), "{}", String::from_utf8_lossy(&quiet));
+
+        let path = layout.root.join(".lock");
+        let other_process = File::create(&path).expect("open the lock file");
+        other_process
+            .lock()
+            .expect("lock it as another process would");
+
+        let (sender, notices) = std::sync::mpsc::channel();
+        let waiter = {
+            let layout = layout.clone();
+            std::thread::spawn(move || lock_reporting_waits(&layout, &mut Relay(sender)))
+        };
+        // Waits for the waiter to start its notice, so the lock is released
+        // only once it is known to have been contended. The timeout is not a
+        // measurement: it is what turns a waiter that blocks *without* a notice
+        // into a failure instead of a test that never ends, since the lock it is
+        // blocked on is released only after this returns.
+        let first = notices.recv_timeout(std::time::Duration::from_secs(60));
+        other_process
+            .unlock()
+            .expect("release the other process's lock");
+        drop(other_process);
+        drop(
+            waiter
+                .join()
+                .expect("the waiting thread panicked")
+                .expect("the lock is taken once the other process releases it"),
+        );
+        let first = first.expect("the run did not say it was waiting for the lock");
+
+        let notice: Vec<u8> = first
+            .into_iter()
+            .chain(notices.into_iter().flatten())
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&notice),
+            format!(
+                "nocompile: waiting for another nocompile run to finish (lock file: {})\n",
+                path.display()
+            )
+        );
+    }
+
+    /// Two runs in one process -- two `#[test]` functions of one suite, the
+    /// ordinary case -- queue behind each other without a word. The second
+    /// must not get in while the first holds the lock, and must not announce
+    /// the wait: a sibling test is no mystery worth a line on stderr, and one
+    /// line per waiting test on every run is noise.
+    #[test]
+    fn runs_in_one_process_queue_silently() {
+        let layout = scratch_layout("lock-queue");
+        let mut quiet = Vec::new();
+        let held = lock_reporting_waits(&layout, &mut quiet).expect("an uncontended lock");
+
+        let (sender, notices) = std::sync::mpsc::channel();
+        let (acquired_sender, acquired) = std::sync::mpsc::channel();
+        let waiter = {
+            let layout = layout.clone();
+            std::thread::spawn(move || {
+                let lock = lock_reporting_waits(&layout, &mut Relay(sender));
+                let _ = acquired_sender.send(());
+                lock
+            })
+        };
+        // A window in which the second run has the chance to get in, or to
+        // announce a wait, and must do neither. It cannot make the test flaky
+        // in the passing direction: a correct lock keeps the waiter out however
+        // long the window is, and a slow machine can only make a broken one
+        // harder to catch.
+        assert!(
+            acquired
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err(),
+            "the second run took the lock while the first held it"
+        );
+        drop(held);
+        drop(
+            waiter
+                .join()
+                .expect("the waiting thread panicked")
+                .expect("the lock is taken once the first run releases it"),
+        );
+
+        let notice: Vec<u8> = notices.into_iter().flatten().collect();
+        assert!(notice.is_empty(), "{}", String::from_utf8_lossy(&notice));
+    }
+
     /// Attribution compares manifest paths textually, so two spellings of one
     /// file detach every message from every fixture at once. What that used to
     /// look like was a suite in which nothing built and the fixtures' own errors
@@ -800,17 +1277,48 @@ mod tests {
     }
 
     /// The check looks for a cargo message, not for a brace, so ordinary output
-    /// that happens to contain JSON-ish text is still skipped quietly.
+    /// that happens to contain JSON-ish text is still skipped quietly -- in the
+    /// middle of a line or at the start of one, and valid JSON or not.
     #[test]
     fn other_text_that_is_not_a_message_is_still_skipped() {
         let mut build = empty();
         ingest(
             &mut build,
-            "look: {\"a\":1} and {\"level\":\"error\"}\n",
+            "look: {\"a\":1} and {\"level\":\"error\"}\n\
+             {\"level\": 3}\n\
+             {\"a\":1} {\"level\":\"error\"}\n\
+             {not json at all\n",
             Path::new(OURS),
         )
         .expect("nothing here is a cargo message");
         assert!(build.messages.is_empty());
+    }
+
+    /// The case that used to fail the whole run: a derive printing a map with
+    /// `{:?}` writes a line that opens with a brace and is not JSON. It is the
+    /// macro's output, not cargo's, and the messages around it are still read.
+    #[test]
+    fn a_debug_printed_map_at_the_start_of_a_line_is_skipped() {
+        let mut build = empty();
+        let stdout = format!(
+            "{{1: \"a\"}}\n{}\n{{}}\n",
+            message(OURS, "f_a", "error", "error: x\n")
+        );
+        ingest(&mut build, &stdout, Path::new(OURS)).expect("not a failure of the run");
+        assert_eq!(build.diagnostics("f_a"), "error: x\n");
+    }
+
+    /// A message forwarded output ran into is still recovered when that output
+    /// opens with a brace, exactly as when it opens with anything else.
+    #[test]
+    fn a_message_behind_brace_led_output_is_still_read() {
+        let mut build = empty();
+        let stdout = format!(
+            "{{1: \"a\"}}{}\n",
+            message(OURS, "f_a", "error", "error: x\n")
+        );
+        ingest(&mut build, &stdout, Path::new(OURS)).expect("the buried message parses");
+        assert_eq!(build.diagnostics("f_a"), "error: x\n");
     }
 
     /// A line that opens like a cargo message but will not parse is a different
