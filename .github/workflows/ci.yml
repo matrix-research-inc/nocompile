@@ -65,6 +65,19 @@ jobs:
       # even after one fails, so a platform-specific failure in the unit tests
       # does not hide the ones in the suites after it.
       - run: cargo test --no-fail-fast
+      # The bless workflow, driven the way the README tells users to drive it:
+      # through the environment variable rather than `.overwrite(true)`, which
+      # is all the self-tests use. Re-blessing the committed goldens on every
+      # platform must reproduce them byte for byte, so this also pins that
+      # blessing is deterministic and that a golden blessed on one machine is
+      # the golden every other machine writes.
+      - name: Re-blessing reproduces the committed goldens
+        shell: bash
+        env:
+          NOCOMPILE: overwrite
+        run: |
+          cargo test --test ui
+          git diff --exit-code -- tests/
 
   lint:
     runs-on: ubuntu-latest
@@ -81,10 +94,13 @@ jobs:
       - uses: actions/checkout@v7
       # The crate's entire pitch, as a test rather than a claim in the README.
       # Dev-dependencies count: a `[dev-dependencies]` entry shows up in
-      # `cargo tree` for anyone auditing the source.
+      # `cargo tree` for anyone auditing the source. `--target all`, because
+      # `cargo tree` otherwise shows only what applies to the runner's own
+      # platform, and a `[target.'cfg(windows)'.dependencies]` entry would pass
+      # this job on Linux while still reaching every Windows user.
       - name: cargo tree must print this crate and nothing else
         run: |
-          tree=$(cargo tree --edges normal,build,dev --all-features)
+          tree=$(cargo tree --edges normal,build,dev --all-features --target all)
           printf '%s\n' "$tree"
           count=$(printf '%s\n' "$tree" | wc -l)
           if [ "$count" -ne 1 ]; then
