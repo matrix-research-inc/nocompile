@@ -208,6 +208,15 @@ fn a_golden_checked_out_with_crlf_still_matches() {
     sandbox.write("ui/rejected.stderr", &golden.replace('\n', "\r\n"));
 
     assert_passed(&t.overwrite(false).run());
+
+    // Nor does a bless see a change there to write or to report.
+    let outcome = t.overwrite(true).run();
+    assert_passed(&outcome);
+    assert_eq!(outcome.blessed().count(), 0, "{}", outcome.report());
+    assert_eq!(
+        sandbox.read("ui/rejected.stderr"),
+        golden.replace('\n', "\r\n")
+    );
 }
 
 /// A real difference is still caught when the golden arrives as CRLF: the

@@ -149,7 +149,11 @@ fn local(brief: &str, fixture: &str) -> String {
 /// Only the CRLF pair is rewritten, which is exactly the transformation git
 /// applied. A lone `\r` is left alone: it is content rather than a line ending,
 /// and rustc can put one in a diagnostic that quotes a fixture's source.
-fn unify_line_endings(text: &str) -> Cow<'_, str> {
+///
+/// Blessing uses it too, to decide whether a golden changed, so that a golden
+/// git checked out as CRLF is not rewritten -- and reported as written -- by
+/// every bless on Windows.
+pub(crate) fn unify_line_endings(text: &str) -> Cow<'_, str> {
     if text.contains('\r') {
         Cow::Owned(text.replace("\r\n", "\n"))
     } else {

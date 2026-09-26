@@ -901,13 +901,19 @@ fn golden_path(fixture: &Path) -> PathBuf {
 /// process, which two runs on different threads can make at once.
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
-/// Write `contents` to the golden at `golden` unless it already holds exactly
-/// that, and say whether it wrote. A missing golden holds nothing, so it is
-/// always written. `shown` is the golden's path as the report names it.
+/// Write `contents` to the golden at `golden` unless it already holds that,
+/// and say whether it wrote. A missing golden holds nothing, so it is always
+/// written. `shown` is the golden's path as the report names it.
 ///
-/// Compared as bytes rather than as text, so a golden that is not valid UTF-8
-/// is merely different and gets replaced, rather than failing the one run that
-/// would fix it.
+/// "Holds that" ignores CRLF against LF line endings, by the same unification
+/// the comparison applies. Git on Windows checks goldens out as CRLF, and
+/// neither git nor the comparison sees a difference there, so a byte-for-byte
+/// test would rewrite and list every golden of the suite on every bless while
+/// changing nothing anyone could commit. A golden left alone that way keeps
+/// its CRLF endings, which is what git expects of the checkout.
+///
+/// A golden that is not valid UTF-8 is merely different and gets replaced,
+/// rather than failing the one run that would fix it.
 ///
 /// The write is atomic. The contents go to a temporary file beside the golden,
 /// which is then renamed over it, and a rename within one directory replaces
@@ -919,8 +925,13 @@ static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 /// that way fails loudly as a mismatch on the next run rather than passing.
 fn write_golden(golden: &Path, shown: &Path, contents: &str) -> Result<bool, Failure> {
     match fs::read(golden) {
-        Ok(existing) if existing == contents.as_bytes() => return Ok(false),
-        Ok(_) => {}
+        Ok(existing) => {
+            if let Ok(existing) = std::str::from_utf8(&existing)
+                && compare::unify_line_endings(existing) == compare::unify_line_endings(contents)
+            {
+                return Ok(false);
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(io_failure(
@@ -1033,6 +1044,21 @@ mod tests {
         // A golden that is not text is different, not an error.
         fs::write(&golden, [0xff, 0xfe]).unwrap();
         assert!(write_golden(&golden, shown, "error: two\n").unwrap());
+
+        // Checked out by git as CRLF: unchanged as far as git and the
+        // comparison are concerned, so neither rewritten nor listed.
+        fs::write(&golden, "error: two\r\n  --> ui/a.rs:1:1\r\n").unwrap();
+        assert!(!write_golden(&golden, shown, "error: two\n  --> ui/a.rs:1:1\n").unwrap());
+        assert_eq!(
+            fs::read_to_string(&golden).unwrap(),
+            "error: two\r\n  --> ui/a.rs:1:1\r\n"
+        );
+        // But a real difference under the CRLF is still one.
+        assert!(write_golden(&golden, shown, "error: three\n  --> ui/a.rs:1:1\n").unwrap());
+        assert_eq!(
+            fs::read_to_string(&golden).unwrap(),
+            "error: three\n  --> ui/a.rs:1:1\n"
+        );
 
         // No temporary file outlives the write that made it.
         assert_eq!(entries(&dir), ["a.stderr"]);
