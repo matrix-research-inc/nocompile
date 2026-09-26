@@ -457,16 +457,33 @@ impl Display for Failure {
 
 impl Error for Failure {}
 
+/// How a fixture that held up did so.
+///
+/// Crate-private: the public view of it is [`CaseOutcome::blessed`]. It sits on
+/// the success side of a case's result, rather than beside it, so that a case
+/// which both failed and wrote a golden cannot be represented -- blessing only
+/// ever happens once every check that could fail the case has passed.
+#[derive(Debug)]
+pub(crate) enum Held {
+    /// Nothing was written: the diagnostics matched the golden, a `pass`
+    /// fixture compiled, or a bless run found the golden already holding
+    /// exactly what it would have written.
+    Checked,
+    /// A bless run wrote this golden, because it was missing or said something
+    /// else. The path is relative to the host crate's manifest directory.
+    Blessed(PathBuf),
+}
+
 /// The result of one fixture.
 #[derive(Debug)]
 pub struct CaseOutcome {
     path: PathBuf,
     kind: Kind,
-    result: Result<(), Failure>,
+    result: Result<Held, Failure>,
 }
 
 impl CaseOutcome {
-    pub(crate) fn new(path: PathBuf, kind: Kind, result: Result<(), Failure>) -> Self {
+    pub(crate) fn new(path: PathBuf, kind: Kind, result: Result<Held, Failure>) -> Self {
         Self { path, kind, result }
     }
 
@@ -488,6 +505,21 @@ impl CaseOutcome {
     /// Whether this case held up.
     pub fn is_success(&self) -> bool {
         self.result.is_ok()
+    }
+
+    /// The golden this case wrote, relative to the host crate's manifest
+    /// directory, if it wrote one.
+    ///
+    /// Only a bless run writes goldens, and only a golden whose content changed:
+    /// one that was missing, or that held something other than what the fixture
+    /// now produces. `None` for every case of an ordinary run, for a `pass`
+    /// fixture, for a case that failed, and for a golden a bless run left as it
+    /// was.
+    pub fn blessed(&self) -> Option<&Path> {
+        match &self.result {
+            Ok(Held::Blessed(golden)) => Some(golden),
+            Ok(Held::Checked) | Err(_) => None,
+        }
     }
 }
 
@@ -522,6 +554,17 @@ impl Outcome {
         self.cases.iter().filter(|case| !case.is_success())
     }
 
+    /// The goldens this run wrote, relative to the host crate's manifest
+    /// directory, in the order their fixtures were registered.
+    ///
+    /// Empty unless blessing was requested. A bless run writes only the goldens
+    /// whose content changed, so this is exactly what the run changed on disk,
+    /// and an empty list after a bless means every golden already held what its
+    /// fixture produces. See [`CaseOutcome::blessed`].
+    pub fn blessed(&self) -> impl Iterator<Item = &Path> {
+        self.cases.iter().filter_map(CaseOutcome::blessed)
+    }
+
     /// Whether every fixture held up and setup was clean.
     pub fn is_success(&self) -> bool {
         self.setup.is_empty() && self.cases.iter().all(CaseOutcome::is_success)
@@ -529,6 +572,11 @@ impl Outcome {
 
     /// A plain-text report. No colour: a test harness that only reads well in
     /// colour reads badly in CI logs, and colour costs a dependency.
+    ///
+    /// The first line is the verdict, since it is what a person skims and what
+    /// a log scraper keys on. Any golden the run wrote is listed directly under
+    /// it, whether or not the run passed: a bless changes files the user is
+    /// about to commit, and the report is the only place that says which.
     pub fn report(&self) -> String {
         use fmt::Write as _;
 
@@ -536,12 +584,38 @@ impl Outcome {
         let failed = self.failures().count();
         let total = self.cases.len();
 
-        if self.setup.is_empty() && failed == 0 {
+        // Setup comes first when it failed. A case count cannot lead then:
+        // with nothing run it reads `0 of 0 case(s) failed`, a zero that looks
+        // like success at exactly the moment the run produced no evidence.
+        if !self.setup.is_empty() {
+            if total == 0 {
+                out.push_str("nocompile: setup failed; no cases ran");
+            } else {
+                let _ = write!(
+                    out,
+                    "nocompile: setup failed; {failed} of {total} case(s) failed"
+                );
+            }
+        } else if failed == 0 {
             let _ = write!(out, "nocompile: {total} case(s) passed");
-            return out;
+        } else {
+            let _ = write!(out, "nocompile: {failed} of {total} case(s) failed");
         }
 
-        let _ = writeln!(out, "nocompile: {failed} of {total} case(s) failed");
+        let blessed: Vec<&Path> = self.blessed().collect();
+        if !blessed.is_empty() {
+            let _ = write!(out, "; {} golden(s) written:", blessed.len());
+            for golden in &blessed {
+                let _ = write!(out, "\n    {}", golden.display());
+            }
+        }
+
+        // A passing run is the verdict and the goldens alone, and ends without
+        // a newline so the common case stays the one line it always was.
+        if self.is_success() {
+            return out;
+        }
+        out.push('\n');
 
         for failure in &self.setup {
             let _ = writeln!(out, "\nSETUP FAILED");
@@ -576,5 +650,111 @@ fn indent(out: &mut String, failure: &Failure) {
             out.push_str(line);
         }
         out.push('\n');
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checked(path: &str) -> CaseOutcome {
+        CaseOutcome::new(PathBuf::from(path), Kind::CompileFail, Ok(Held::Checked))
+    }
+
+    fn blessed(path: &str) -> CaseOutcome {
+        let golden = Path::new(path).with_extension("stderr");
+        CaseOutcome::new(
+            PathBuf::from(path),
+            Kind::CompileFail,
+            Ok(Held::Blessed(golden)),
+        )
+    }
+
+    fn compiled(path: &str) -> CaseOutcome {
+        CaseOutcome::new(
+            PathBuf::from(path),
+            Kind::CompileFail,
+            Err(Failure::Compiled),
+        )
+    }
+
+    fn missing_directory() -> Failure {
+        Failure::Io {
+            context: "could not read the fixture directory tests/ui".to_string(),
+            message: "No such file or directory".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_passing_run_that_wrote_nothing_is_one_line() {
+        let outcome = Outcome::new(Vec::new(), vec![checked("ui/a.rs"), checked("ui/b.rs")]);
+        assert_eq!(outcome.report(), "nocompile: 2 case(s) passed");
+        assert_eq!(outcome.blessed().count(), 0);
+    }
+
+    #[test]
+    fn a_passing_bless_lists_the_goldens_it_wrote_in_registration_order() {
+        let outcome = Outcome::new(
+            Vec::new(),
+            vec![blessed("ui/b.rs"), checked("ui/c.rs"), blessed("ui/a.rs")],
+        );
+        assert_eq!(
+            outcome.blessed().collect::<Vec<_>>(),
+            [Path::new("ui/b.stderr"), Path::new("ui/a.stderr")]
+        );
+        assert_eq!(
+            outcome.report(),
+            "nocompile: 3 case(s) passed; 2 golden(s) written:\n    ui/b.stderr\n    ui/a.stderr"
+        );
+    }
+
+    #[test]
+    fn a_failing_bless_still_lists_the_goldens_it_wrote() {
+        let outcome = Outcome::new(Vec::new(), vec![compiled("ui/a.rs"), blessed("ui/b.rs")]);
+        let report = outcome.report();
+        assert!(
+            report.starts_with(
+                "nocompile: 1 of 2 case(s) failed; 1 golden(s) written:\n    ui/b.stderr\n\n\
+                 FAIL ui/a.rs (compile_fail)\n"
+            ),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_setup_failure_with_nothing_run_does_not_lead_with_a_count() {
+        let outcome = Outcome::new(vec![missing_directory()], Vec::new());
+        let report = outcome.report();
+        assert!(
+            report.starts_with("nocompile: setup failed; no cases ran\n\nSETUP FAILED\n"),
+            "{report}"
+        );
+        assert!(!report.contains("0 of 0"), "{report}");
+    }
+
+    #[test]
+    fn a_setup_failure_beside_cases_that_ran_leads_with_the_setup_failure() {
+        // Registration-time problems travel with the run, so the cases that
+        // were registered successfully still run and are still counted.
+        let outcome = Outcome::new(
+            vec![missing_directory()],
+            vec![checked("ui/a.rs"), compiled("ui/b.rs")],
+        );
+        let report = outcome.report();
+        assert!(
+            report.starts_with("nocompile: setup failed; 1 of 2 case(s) failed\n\nSETUP FAILED\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("\nFAIL ui/b.rs (compile_fail)\n"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn only_a_case_that_held_up_can_report_a_blessed_golden() {
+        assert_eq!(blessed("ui/a.rs").blessed(), Some(Path::new("ui/a.stderr")));
+        assert_eq!(checked("ui/a.rs").blessed(), None);
+        assert_eq!(compiled("ui/a.rs").blessed(), None);
     }
 }

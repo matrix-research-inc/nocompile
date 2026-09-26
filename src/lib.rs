@@ -24,8 +24,9 @@
 //!
 //! A `compile_fail` fixture must fail, and its diagnostics must match the
 //! `.stderr` golden beside it. Run the suite with `NOCOMPILE=overwrite` to write
-//! the goldens, then **read what they captured**. A missing golden is a failure
-//! rather than an implicit bless, so that step cannot be skipped.
+//! the goldens, then **read what they captured**. The run lists every golden it
+//! wrote, and writes only those whose content changed. A missing golden is a
+//! failure rather than an implicit bless, so that step cannot be skipped.
 //!
 //! # Choosing a mode
 //!
