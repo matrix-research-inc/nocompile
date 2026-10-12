@@ -46,6 +46,16 @@ t.raw_manifest_lines("[features]\nfoo = []");   // escape hatch
 let outcome = t.run();                          // non-panicking, returns a report
 ```
 
+A dependency's features are chosen the way Cargo chooses them:
+
+```rust
+t.dependency(
+    nocompile::Dependency::path("my-crate", ".")
+        .features(["serde"])                    // Cargo's `features`
+        .default_features(false),               // Cargo's `default-features`
+);
+```
+
 ## Choosing a mode
 
 `.stderr` goldens break whenever rustc reflows a diagnostic. The mode decides how much of the diagnostic is compared, and so how often that happens.

@@ -181,14 +181,14 @@ pub enum Failure {
         /// The offending line.
         line: String,
     },
-    /// `dependency_path` was given an empty name. Nothing is built while this
-    /// stands.
+    /// A dependency was declared with an empty name. Nothing is built while
+    /// this stands.
     EmptyDependencyName {
         /// The dependency's resolved path, to say which call it was.
         path: PathBuf,
     },
-    /// `dependency_path` was given a name whose normalization placeholder is
-    /// one the harness reserves for something else -- `rust` would become
+    /// A dependency was declared with a name whose normalization placeholder
+    /// is one the harness reserves for something else -- `rust` would become
     /// `$RUST`, the toolchain's source. Nothing is built while this stands.
     ///
     /// Refused by name, whether or not the dependency would actually receive a
@@ -206,6 +206,17 @@ pub enum Failure {
         name: String,
         /// Its resolved path, exactly. Displayed lossily.
         path: PathBuf,
+    },
+    /// One dependency declared twice, differently: another path, other
+    /// features, or default features on in one and off in the other. Nothing
+    /// is built while this stands.
+    ConflictingDependency {
+        /// The dependency's name.
+        name: String,
+        /// The first declaration, as the manifest would write it.
+        registered: String,
+        /// The declaration that disagreed with it, written the same way.
+        conflicting: String,
     },
     /// Cargo itself failed -- a manifest it could not parse, a dependency it
     /// could not resolve. Not a property of the fixture.
@@ -250,7 +261,8 @@ impl Failure {
             Failure::RawManifestLinesWithoutHeader { .. }
             | Failure::EmptyDependencyName { .. }
             | Failure::ReservedDependencyName { .. }
-            | Failure::NonUtf8Dependency { .. } => true,
+            | Failure::NonUtf8Dependency { .. }
+            | Failure::ConflictingDependency { .. } => true,
             Failure::Compiled
             | Failure::DidNotCompile { .. }
             | Failure::NoDiagnostics { .. }
@@ -409,17 +421,17 @@ impl Display for Failure {
             ),
             Failure::EmptyDependencyName { path } => write!(
                 f,
-                "dependency_path was given an empty name for the dependency at {}. The name must \
+                "a dependency was declared with an empty name, for the path {}. The name must \
                  be the dependency's package name, exactly as its Cargo.toml spells it. Nothing \
                  was built.",
                 path.display()
             ),
             Failure::ReservedDependencyName { name, placeholder } => write!(
                 f,
-                "dependency_path was given the name `{name}`, whose normalization placeholder \
-                 {placeholder} is reserved for something else: a path into the dependency would \
-                 read in every golden as that, not as the dependency. A crate with this package \
-                 name can still be declared through raw_manifest_lines, as a \
+                "a dependency was declared with the name `{name}`, whose normalization \
+                 placeholder {placeholder} is reserved for something else: a path into the \
+                 dependency would read in every golden as that, not as the dependency. A crate \
+                 with this package name can still be declared through raw_manifest_lines, as a \
                  [dependencies.{name}] table, at the cost of having no placeholder. Nothing was \
                  built."
             ),
@@ -429,6 +441,19 @@ impl Display for Failure {
                  UTF-8 and cannot name it, so cargo could not find the dependency. Move it to a \
                  path that is valid UTF-8. Nothing was built.",
                 path.display()
+            ),
+            Failure::ConflictingDependency {
+                name,
+                registered,
+                conflicting,
+            } => write!(
+                f,
+                "dependency `{name}` is declared twice, differently:\n\n\
+                 \x20   {name} = {registered}\n\
+                 \x20   {name} = {conflicting}\n\n\
+                 The generated manifest holds one entry per dependency, and the harness will not \
+                 guess which was meant. Declare it once, with every feature the fixtures need. \
+                 Nothing was built."
             ),
             Failure::Cargo { message } => {
                 write!(f, "cargo could not run the fixture build:\n\n{message}")
