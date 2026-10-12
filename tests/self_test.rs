@@ -977,6 +977,10 @@ fn a_fixture_in_an_unregistered_subdirectory_fails_the_run() {
     );
     let report = outcome.report();
     assert!(report.contains("not recursive"), "{report}");
+    assert!(
+        report.contains("each TestCases sees only its own registrations"),
+        "{report}"
+    );
     // The top-level fixture still ran; only the nested ones are missing.
     assert_eq!(outcome.cases().len(), 1);
     assert!(outcome.cases()[0].is_success(), "{report}");
