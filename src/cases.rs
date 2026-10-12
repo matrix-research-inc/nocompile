@@ -271,11 +271,12 @@ impl TestCases {
     ///
     /// Registration is not recursive, and it is checked rather than trusted:
     /// when the suite runs, every `.rs` file anywhere under `dir` must be
-    /// covered by some registration -- this one, one of the subdirectory
-    /// holding it, or one of the file itself -- and every `.stderr` file must
-    /// be the golden of a registered `compile_fail` fixture. Anything else
-    /// fails the run, named. A fixture in a subdirectory is registered by
-    /// registering that subdirectory, before or after this call.
+    /// covered by some registration on this `TestCases` -- this one, one of the
+    /// subdirectory holding it, or one of the file itself -- and every
+    /// `.stderr` file must be the golden of a registered `compile_fail`
+    /// fixture. Anything else fails the run, named. A fixture in a
+    /// subdirectory is registered by registering that subdirectory, before or
+    /// after this call.
     pub fn compile_fail_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
         self.push_dir(dir.as_ref(), Kind::CompileFail);
         self

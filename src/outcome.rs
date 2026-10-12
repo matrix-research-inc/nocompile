@@ -130,6 +130,11 @@ pub enum Failure {
     /// registered directory, found when the suite runs rather than when it
     /// registers, because the registration that would cover a subdirectory may
     /// come later.
+    ///
+    /// A `TestCases` sees only its own registrations, so a subdirectory that
+    /// another one registers (a second suite in another [`Mode`], say) is
+    /// reported here too; such a suite's fixtures belong in a directory of their
+    /// own, beside the registered directory rather than under it.
     UnregisteredFixtures {
         /// The registered directory the files were found under.
         directory: PathBuf,
@@ -379,7 +384,10 @@ impl Display for Failure {
                     f,
                     "\nRegistering a directory is not recursive: it takes the .rs files directly \
                      in {directory} and nothing below it. Register the subdirectory that holds \
-                     them, or move a file that is not a fixture out from under {directory}."
+                     them, or move a file that is not a fixture out from under {directory}. If \
+                     another TestCases registers that subdirectory (in another mode, say), move \
+                     it beside {directory} rather than under it: each TestCases sees only its own \
+                     registrations."
                 )
             }
             Failure::OrphanGolden { golden } => write!(
