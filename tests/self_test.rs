@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use nocompile::{Failure, Mode, Outcome, TestCases};
+use nocompile::{Dependency, Failure, Mode, Outcome, TestCases};
 
 /// A throwaway host crate: a directory of fixtures the test owns outright.
 struct Sandbox {
@@ -1227,6 +1227,42 @@ fn a_declared_path_dependency_reaches_the_fixtures() {
         "{golden}"
     );
     assert!(golden.contains("--> ui/misuses_helper.rs:2:22"), "{golden}");
+}
+
+/// A dependency's features reach its build: one named is turned on, and with
+/// `default_features(false)` its default one is off. Each fixture compiles only
+/// if its setting took effect.
+#[test]
+fn a_dependencys_features_reach_its_build() {
+    let sandbox = Sandbox::new("dependency-features");
+    sandbox.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [features]\ndefault = [\"base\"]\nbase = []\nextra = []\n",
+    );
+    sandbox.write(
+        "helper/src/lib.rs",
+        "pub const BASE: bool = cfg!(feature = \"base\");\n\n\
+         #[cfg(feature = \"extra\")]\npub fn extra() -> u8 {\n    0\n}\n",
+    );
+    sandbox.write(
+        "ui-pass/extra_is_on.rs",
+        "fn main() {\n    let _x: u8 = helper::extra();\n}\n",
+    );
+    sandbox.write(
+        "ui-pass/base_is_off.rs",
+        "const _: () = assert!(!helper::BASE, \"the default features are on\");\n\n\
+         fn main() {}\n",
+    );
+
+    let mut t = sandbox.cases();
+    t.dependency(
+        Dependency::path("helper", "helper")
+            .features(["extra"])
+            .default_features(false),
+    );
+    t.pass_dir("ui-pass");
+    assert_passed(&t.overwrite(false).run());
 }
 
 /// A crate whose guard is a panic in a generic `const`, and whose `take`,

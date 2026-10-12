@@ -93,7 +93,7 @@
 //! the fixture's own source, and a fixture cannot contain this machine's
 //! manifest directory or scratch root.
 //!
-use crate::scratch::Dependency;
+use crate::dependency::Dependency;
 use std::env;
 use std::path::Path;
 use std::process::Command;
@@ -120,7 +120,7 @@ pub(crate) const IMPLEMENTORS: &str = "$IMPLEMENTORS";
 ///
 /// A dependency whose placeholder matched one of these would render a path into
 /// it exactly as the thing the fixed placeholder stands for, and a golden could
-/// no longer say which was meant. `TestCases::dependency_path` refuses such a
+/// no longer say which was meant. `TestCases::dependency` refuses such a
 /// name against this list, so a placeholder added above belongs here too, and
 /// in the list of refused names that method documents.
 pub(crate) const RESERVED: [&str; 8] = [

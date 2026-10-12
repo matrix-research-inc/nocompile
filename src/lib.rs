@@ -136,6 +136,7 @@
 mod cases;
 mod compare;
 mod compile;
+mod dependency;
 mod diff;
 mod json;
 mod normalize;
@@ -145,6 +146,7 @@ mod scratch;
 
 pub use crate::cases::{OVERWRITE_VAR, TestCases};
 pub use crate::compare::Mode;
+pub use crate::dependency::Dependency;
 pub use crate::outcome::{CaseOutcome, Failure, Kind, Outcome};
 
 /// Build a [`TestCases`] for the crate the macro is expanded in.

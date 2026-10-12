@@ -20,18 +20,12 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use crate::dependency::Dependency;
 use crate::path::lexical_join;
 
 /// The package name of the generated project. It appears only in cargo's own
 /// own error lines, which carry no fixture attribution and so reach no golden.
 pub(crate) const CRATE_NAME: &str = "nocompile-scratch";
-
-/// A path dependency the caller declared.
-#[derive(Debug, Clone)]
-pub(crate) struct Dependency {
-    pub(crate) name: String,
-    pub(crate) path: PathBuf,
-}
 
 /// Where the scratch project and its private target directory live.
 #[derive(Debug, Clone)]
@@ -241,9 +235,9 @@ pub(crate) fn manifest(
     out.push_str("[dependencies]\n");
     for dep in deps {
         out.push_str(&format!(
-            "{} = {{ path = {} }}\n",
+            "{} = {}\n",
             toml_key(&dep.name),
-            toml_string(&dep.path.display().to_string()),
+            dependency_entry(dep)
         ));
     }
     out.push('\n');
@@ -253,10 +247,7 @@ pub(crate) fn manifest(
     for bin in bins {
         out.push_str("\n[[bin]]\n");
         out.push_str(&format!("name = {}\n", toml_string(bin)));
-        out.push_str(&format!(
-            "path = {}\n",
-            toml_string(&format!("src/bin/{bin}.rs"))
-        ));
+        out.push_str(&format!("path = {}\n", toml_string(&bin_relative(bin))));
     }
 
     for lines in raw {
@@ -266,6 +257,24 @@ pub(crate) fn manifest(
     }
 
     out
+}
+
+/// A dependency's entry in `[dependencies]`, as an inline table.
+///
+/// `features` and `default-features` are written only when they differ from
+/// Cargo's defaults, so a dependency declared by path alone is the one line it
+/// always was, and the manifest of a suite that sets neither does not change.
+pub(crate) fn dependency_entry(dep: &Dependency) -> String {
+    let mut entry = format!("{{ path = {}", toml_string(&dep.path.display().to_string()));
+    if !dep.features.is_empty() {
+        let features: Vec<String> = dep.features.iter().map(|f| toml_string(f)).collect();
+        entry.push_str(&format!(", features = [{}]", features.join(", ")));
+    }
+    if !dep.default_features {
+        entry.push_str(", default-features = false");
+    }
+    entry.push_str(" }");
+    entry
 }
 
 /// A bare TOML key where the name allows it, a quoted one otherwise.
@@ -379,10 +388,7 @@ mod tests {
     fn writes_path_dependencies() {
         let m = manifest(
             "2024",
-            &[Dependency {
-                name: "my-crate".into(),
-                path: "/w/my-crate".into(),
-            }],
+            &[Dependency::path("my-crate", "/w/my-crate")],
             &[],
             &[],
         );
@@ -398,16 +404,38 @@ mod tests {
 
     #[test]
     fn escapes_paths_that_need_it() {
-        let m = manifest(
-            "2021",
-            &[Dependency {
-                name: "c".into(),
-                path: "/a\"b\\c".into(),
-            }],
-            &[],
-            &[],
-        );
+        let m = manifest("2021", &[Dependency::path("c", "/a\"b\\c")], &[], &[]);
         assert!(m.contains(r#"c = { path = "/a\"b\\c" }"#), "{m}");
+    }
+
+    /// Each setting is written only when it differs from Cargo's default.
+    /// Features are written sorted, once each, and escaped like any TOML
+    /// string, so a name that needs it stays one string for cargo to judge.
+    #[test]
+    fn writes_a_dependencys_features_and_default_features() {
+        let dep = || Dependency::path("c", "/c");
+        let table = [
+            (dep(), r#"{ path = "/c" }"#),
+            (
+                dep().features(["a"]),
+                r#"{ path = "/c", features = ["a"] }"#,
+            ),
+            (
+                dep().default_features(false),
+                r#"{ path = "/c", default-features = false }"#,
+            ),
+            (
+                dep().features(["z", "a", "z"]).default_features(false),
+                r#"{ path = "/c", features = ["a", "z"], default-features = false }"#,
+            ),
+            (
+                dep().features(["a\"b", "c\\d", "e\nf", "g/h"]),
+                r#"{ path = "/c", features = ["a\"b", "c\\d", "e\nf", "g/h"] }"#,
+            ),
+        ];
+        for (dep, expected) in table {
+            assert_eq!(dependency_entry(&dep), expected);
+        }
     }
 
     #[test]

@@ -11,10 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::compare::{self, Mode};
 use crate::compile;
+use crate::dependency::Dependency;
 use crate::normalize::{self, Normalizer};
 use crate::outcome::{CaseOutcome, Failure, Held, Kind, Outcome};
 use crate::path::lexical_join;
-use crate::scratch::{self, Dependency, Layout};
+use crate::scratch::{self, Layout};
 
 /// The environment variable that turns a run into a blessing run.
 pub const OVERWRITE_VAR: &str = "NOCOMPILE";
@@ -99,14 +100,8 @@ impl TestCases {
         }
     }
 
-    /// Make a crate available to every fixture, by path.
-    ///
-    /// `name` is the dependency's package name, verbatim: the `name` in its
-    /// `Cargo.toml`. Cargo does not treat `-` and `_` as interchangeable here,
-    /// so `my_crate` does not find a package named `my-crate`, even though the
-    /// fixtures refer to it as `my_crate`. `path` is resolved against the host
-    /// crate's manifest directory. In the common case this is one line naming
-    /// the crate under test.
+    /// Make a crate available to every fixture, by path. In the common case
+    /// this is one line naming the crate under test.
     ///
     /// Dependencies are declared rather than inferred from the host manifest.
     /// That removes the harness's two heaviest steps, and it is also tighter:
@@ -114,9 +109,30 @@ impl TestCases {
     /// so a fixture could quietly lean on something the invariant under test
     /// never mentions.
     ///
+    /// Shorthand for `dependency(Dependency::path(name, path))`. See
+    /// [`Dependency::path`] for what `name` and `path` mean, and
+    /// [`dependency`](TestCases::dependency) to choose the dependency's
+    /// features, and for what else a declaration does and which it refuses.
+    pub fn dependency_path(
+        &mut self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+    ) -> &mut Self {
+        self.dependency(Dependency::path(name, path.as_ref()))
+    }
+
+    /// Make a crate available to every fixture, with the features it is built
+    /// with. See [`Dependency`].
+    ///
     /// A dependency outside the host crate also gets a normalization
     /// placeholder, `my-crate` becoming `$MY_CRATE`, so a diagnostic that points
     /// into its source does not put an absolute path in a golden.
+    ///
+    /// Declaring one dependency again, by the same name, path, features and
+    /// default features, asks for nothing new and is ignored, as registering a
+    /// fixture twice is. The order the features were named in does not matter.
+    /// Paths are compared as resolved, not through the filesystem, so the same
+    /// directory reached through a symlink counts as another path.
     ///
     /// Some declarations are refused, each as a setup failure that stops the
     /// run before anything is built: an empty `name`; a `name` whose
@@ -124,20 +140,29 @@ impl TestCases {
     /// (`dir`, `scratch`, `cargo-registry`, `cargo-home`, `rust`, `crate`, `n`,
     /// `implementors`), refused whether or not this dependency would actually
     /// receive a placeholder, so the rule does not depend on where it lives;
-    /// and a `path` that is not valid UTF-8, which a Cargo manifest cannot
-    /// name.
-    pub fn dependency_path(
-        &mut self,
-        name: impl Into<String>,
-        path: impl AsRef<Path>,
-    ) -> &mut Self {
-        let name = name.into();
-        let path = lexical_join(&self.manifest_dir, path.as_ref());
-        let refusals = dependency_refusals(&name, &path);
-        if refusals.is_empty() {
-            self.dependencies.push(Dependency { name, path });
-        } else {
+    /// a `path` that is not valid UTF-8, which a Cargo manifest cannot name;
+    /// and a second declaration of a `name` that differs from the first in
+    /// anything, since a manifest holds one entry per dependency and the
+    /// harness will not guess which was meant.
+    pub fn dependency(&mut self, mut dependency: Dependency) -> &mut Self {
+        dependency.path = lexical_join(&self.manifest_dir, &dependency.path);
+        let refusals = dependency_refusals(&dependency.name, &dependency.path);
+        if !refusals.is_empty() {
             self.setup.extend(refusals);
+            return self;
+        }
+        match self
+            .dependencies
+            .iter()
+            .find(|existing| existing.name == dependency.name)
+        {
+            None => self.dependencies.push(dependency),
+            Some(existing) if *existing == dependency => {}
+            Some(existing) => self.setup.push(Failure::ConflictingDependency {
+                name: dependency.name.clone(),
+                registered: scratch::dependency_entry(existing),
+                conflicting: scratch::dependency_entry(&dependency),
+            }),
         }
         self
     }
@@ -1233,6 +1258,59 @@ mod tests {
         t.dependency_path("rusty", "../rusty");
         assert!(t.setup.is_empty(), "{:?}", t.setup);
         assert_eq!(t.dependencies.len(), 2);
+    }
+
+    /// Every spelling of one declaration is one dependency, as every spelling
+    /// of one fixture is one case: the manifest could not hold it twice.
+    #[test]
+    fn a_dependency_declared_twice_the_same_way_is_one_dependency() {
+        let mut t = TestCases::new("/w", "host");
+        t.dependency_path("helper", "helper");
+        t.dependency_path("helper", "./helper");
+        t.dependency(Dependency::path("helper", "/w/helper"));
+        // Features are a set: their order and repetition say nothing.
+        t.dependency(Dependency::path("other", "other").features(["b", "a"]));
+        t.dependency(Dependency::path("other", "other").features(["a", "b", "a"]));
+        assert!(t.setup.is_empty(), "{:?}", t.setup);
+        assert_eq!(t.dependencies.len(), 2);
+    }
+
+    /// One name declared two ways asks for two builds of one dependency, and
+    /// the manifest holds one entry for it. Each way it can differ is named,
+    /// and none of them is built.
+    #[test]
+    fn a_dependency_declared_twice_differently_is_refused() {
+        let mut t = TestCases::new("/w", "host");
+        t.dependency_path("helper", "helper");
+        t.dependency(Dependency::path("helper", "helper").features(["extra"]));
+        t.dependency(Dependency::path("helper", "helper").default_features(false));
+        t.dependency_path("helper", "elsewhere");
+        assert_eq!(t.dependencies.len(), 1, "the first declaration stands");
+        assert!(t.setup.iter().all(Failure::refuses_the_manifest));
+
+        let conflicting: Vec<&str> = t
+            .setup
+            .iter()
+            .map(|failure| match failure {
+                Failure::ConflictingDependency { conflicting, .. } => conflicting.as_str(),
+                other => panic!("expected ConflictingDependency, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(conflicting.len(), 3, "{:?}", t.setup);
+        assert!(
+            conflicting[0].contains(r#"features = ["extra"]"#),
+            "{conflicting:?}"
+        );
+        assert!(
+            conflicting[1].contains("default-features = false"),
+            "{conflicting:?}"
+        );
+        assert!(conflicting[2].contains("elsewhere"), "{conflicting:?}");
+        let message = t.setup[0].to_string();
+        assert!(
+            message.contains("dependency `helper` is declared twice, differently"),
+            "{message}"
+        );
     }
 
     /// A refused dependency stops the run before anything is built, rather than
